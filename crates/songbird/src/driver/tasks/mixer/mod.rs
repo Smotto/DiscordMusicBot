@@ -33,7 +33,7 @@ use opus2::{Application as CodingMode, Bitrate, Encoder as OpusEncoder, SoftClip
 use rand::random;
 use rubato::{FftFixedOut, Resampler};
 use std::{
-    io::Write,
+    io::{Error as IoError, ErrorKind, Write},
     result::Result as StdResult,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
@@ -91,6 +91,8 @@ pub struct Mixer {
 fn new_encoder(bitrate: Bitrate, mix_mode: MixMode) -> Result<OpusEncoder> {
     let mut encoder = OpusEncoder::new(SAMPLE_RATE, mix_mode.to_opus(), CodingMode::Audio)?;
     encoder.set_bitrate(bitrate)?;
+    // DTX emits [0xF8,0xFF,0xFE] which DAVE leaves unencrypted — invalid on E2E channels.
+    encoder.set_dtx(false)?;
 
     Ok(encoder)
 }
@@ -209,7 +211,7 @@ impl Mixer {
 
     pub(crate) fn full_reconnect_gateway(&mut self) -> StdResult<(), SendError<CoreMessage>> {
         self.conn_active = None;
-        self.interconnect.core.send(CoreMessage::FullReconnect)
+        self.interconnect.core.send(CoreMessage::FullReconnect(None))
     }
 
     #[inline]
@@ -549,7 +551,28 @@ impl Mixer {
         // ~5 frames of silence (unless another good audio frame appears) before we
         // stop sending RTP frames.
         if mix_len == MixType::MixedPcm(0) {
-            if self.silence_frames > 0 {
+            let dave_active = self
+                .conn_active
+                .as_ref()
+                .is_some_and(|c| c.dave_protocol_version.load(Ordering::Relaxed) != 0);
+            if dave_active {
+                if self.silence_frames > 0 {
+                    self.silence_frames -= 1;
+                    let frame_samples = self.config.mix_mode.sample_count_in_frame();
+                    for sample in self
+                        .sample_buffer
+                        .samples_mut()
+                        .iter_mut()
+                        .take(frame_samples)
+                    {
+                        // Avoid Opus DTX silence ([0xF8,0xFF,0xFE]) which DAVE leaves unencrypted.
+                        *sample = 1.0e-5;
+                    }
+                    mix_len = MixType::MixedPcm(MONO_FRAME_SIZE);
+                } else {
+                    return Ok(0);
+                }
+            } else if self.silence_frames > 0 {
                 self.silence_frames -= 1;
                 let mut rtp = MutableRtpPacket::new(packet).expect(
                     "FATAL: Too few bytes in self.packet for RTP header.\
@@ -652,19 +675,48 @@ impl Mixer {
         };
 
         if conn.dave_protocol_version.load(Ordering::Relaxed) != 0 {
-            if let Some(ref mut dave_session) = *conn.dave_session.write().unwrap() {
-                if dave_session.is_ready() {
-                    let encrypted = dave_session
-                        .encrypt_opus(
-                            &payload[first_payload_byte..first_payload_byte + payload_len],
-                        )?
-                        .into_owned();
-                    payload_len = encrypted.len();
-
-                    payload[first_payload_byte..first_payload_byte + payload_len]
-                        .copy_from_slice(&encrypted);
-                }
+            if !conn.dave_media_allowed.load(Ordering::Acquire) {
+                return Err(Error::Io(IoError::from(ErrorKind::WouldBlock)));
             }
+
+            let dave_ready = conn
+                .dave_session
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|session| session.is_ready());
+            if !dave_ready {
+                // Never send cleartext Opus when DAVE is required — Discord invalidates the session.
+                return Err(Error::Io(IoError::from(ErrorKind::WouldBlock)));
+            }
+
+            let opus_payload = &payload[first_payload_byte..first_payload_byte + payload_len];
+            // DAVE leaves Opus DTX silence unencrypted; Discord rejects that on E2E channels.
+            if payload_len == SILENT_FRAME.len() && opus_payload == SILENT_FRAME.as_slice() {
+                return Err(Error::Io(IoError::from(ErrorKind::WouldBlock)));
+            }
+
+            let encrypted = match conn
+                .dave_session
+                .write()
+                .unwrap()
+                .as_mut()
+                .expect("DAVE session missing while protocol version is non-zero")
+                .encrypt_opus(opus_payload)
+            {
+                Ok(e) => e.into_owned(),
+                Err(e) => {
+                    tracing::warn!("DAVE encrypt_opus failed: {:?}", e);
+                    return Err(Error::Io(IoError::new(
+                        std::io::ErrorKind::Other,
+                        format!("DAVE encrypt_opus failed: {e:?}"),
+                    )));
+                }
+            };
+            payload_len = encrypted.len();
+
+            payload[first_payload_byte..first_payload_byte + payload_len]
+                .copy_from_slice(&encrypted);
         }
 
         let final_payload_size = conn
@@ -744,6 +796,13 @@ impl Mixer {
 
     #[inline]
     pub(crate) fn send_gateway_speaking(&self) -> Result<()> {
+        if let Some(conn) = &self.conn_active {
+            if conn.dave_protocol_version.load(Ordering::Relaxed) != 0
+                && !conn.dave_media_allowed.load(Ordering::Acquire)
+            {
+                return Ok(());
+            }
+        }
         if let Some(ws) = &self.ws {
             ws.send(WsMessage::Speaking(true))?;
         }
@@ -786,7 +845,12 @@ impl Mixer {
                 last_live_vol = track.volume;
             }
         }
-        let do_passthrough = num_live == 1 && (last_live_vol - 1.0).abs() < f32::EPSILON;
+        let dave_active = self
+            .conn_active
+            .as_ref()
+            .is_some_and(|c| c.dave_protocol_version.load(Ordering::Relaxed) != 0);
+        let do_passthrough =
+            !dave_active && num_live == 1 && (last_live_vol - 1.0).abs() < f32::EPSILON;
 
         let mut len = 0;
         for (i, track) in self.tracks.iter_mut().enumerate() {

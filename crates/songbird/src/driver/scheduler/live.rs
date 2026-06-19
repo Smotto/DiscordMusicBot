@@ -261,12 +261,12 @@ impl Live {
             if *packet_len > 0 {
                 let res = mixer.send_packet(&packet[..*packet_len]);
                 rebuild_if_err(mixer, res, &mut self.to_cull, i);
+                advance_rtp_counters(packet);
             }
             #[cfg(test)]
             if *packet_len == 0 {
                 mixer.test_signal_empty_tick();
             }
-            advance_rtp_counters(packet);
         }
 
         for (i, mixer) in self.tasks.iter_mut().enumerate() {

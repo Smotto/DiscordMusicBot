@@ -23,7 +23,8 @@ pub enum CoreMessage {
     Reconnect,
     /// Push refreshed voice gateway credentials to the live websocket task.
     UpdateConnectionInfo(ConnectionInfo),
-    FullReconnect,
+    /// Rebuild the voice session. Uses the bundled info when present.
+    FullReconnect(Option<ConnectionInfo>),
     RebuildInterconnect,
     #[cfg(feature = "receive")]
     MarkSsrcMapped(u32),

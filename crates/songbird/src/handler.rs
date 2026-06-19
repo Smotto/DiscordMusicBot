@@ -61,6 +61,10 @@ pub struct Call {
     /// [`new`]: Call::new
     /// [`standalone`]: Call::standalone
     ws: Option<Shard>,
+
+    /// Whether the voice driver currently has an active UDP/WebSocket session.
+    #[cfg(feature = "driver")]
+    voice_driver_active: bool,
 }
 
 impl Call {
@@ -128,6 +132,8 @@ impl Call {
             self_mute: false,
             user_id,
             ws,
+            #[cfg(feature = "driver")]
+            voice_driver_active: false,
         }
     }
 
@@ -144,6 +150,7 @@ impl Call {
                 _ = first_tx.send(());
 
                 self.driver.raw_connect(c.clone(), driver_tx.clone());
+                self.voice_driver_active = true;
             },
             _ => {},
         }
@@ -250,6 +257,7 @@ impl Call {
             // if it had a problem earlier.
             let info = self.current_connection().unwrap().clone();
             self.driver.raw_connect(info, tx.clone());
+            self.voice_driver_active = true;
 
             Ok(Join::new(
                 rx.into_recv_async(),
@@ -431,6 +439,42 @@ impl Call {
         if let Some((ConnectionProgress::Complete(info), _)) = &self.connection {
             self.driver.update_connection_info(info.clone());
         }
+    }
+
+    /// Returns whether the voice driver has an active UDP/WebSocket session.
+    #[cfg(feature = "driver")]
+    pub fn is_voice_driver_active(&self) -> bool {
+        self.voice_driver_active
+    }
+
+    /// Reconnect the voice driver if it was dropped while the bot remains in-channel.
+    #[cfg(feature = "driver")]
+    pub fn reconnect_voice_driver_if_inactive(&mut self) -> bool {
+        if self.voice_driver_active {
+            return true;
+        }
+        self.reconnect_voice_driver()
+    }
+
+    /// Reconnect the voice driver using the latest stored [`ConnectionInfo`].
+    #[cfg(feature = "driver")]
+    pub fn reconnect_voice_driver(&mut self) -> bool {
+        let Some(info) = self
+            .connection
+            .as_ref()
+            .and_then(|(progress, _)| progress.info())
+        else {
+            tracing::warn!("Voice driver reconnect requested but no connection info is available");
+            return false;
+        };
+
+        tracing::info!(
+            "Reconnecting voice driver for guild {} with last known credentials",
+            info.guild_id
+        );
+        self.driver.full_reconnect(info);
+        self.voice_driver_active = true;
+        true
     }
 
     /// Updates the internal voice state of the current user.

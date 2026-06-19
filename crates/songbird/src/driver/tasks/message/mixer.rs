@@ -11,7 +11,10 @@ use crate::{
 use flume::Sender;
 use std::{
     net::UdpSocket,
-    sync::{atomic::AtomicU16, Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU16},
+        Arc, RwLock,
+    },
 };
 use symphonia_core::{errors::Error as SymphoniaError, formats::SeekedTo};
 
@@ -20,6 +23,8 @@ pub struct MixerConnection {
     pub crypto_state: CryptoState,
     pub dave_session: Arc<RwLock<Option<davey::DaveSession>>>,
     pub dave_protocol_version: Arc<AtomicU16>,
+    /// False until Discord sends `DaveExecuteTransition` for the active epoch.
+    pub dave_media_allowed: Arc<AtomicBool>,
     #[cfg(feature = "receive")]
     pub udp_rx: Sender<UdpRxMessage>,
     #[cfg(feature = "receive")]

@@ -1,9 +1,9 @@
 use super::message::*;
 use crate::{
     driver::tasks::error::DaveReinitError,
-    events::{context_data::DisconnectReason, CoreContext},
+    events::CoreContext,
     model::{
-        payload::{Heartbeat, Speaking},
+        payload::Speaking,
         CloseCode as VoiceCloseCode,
         Event as GatewayEvent,
         FromPrimitive,
@@ -28,7 +28,7 @@ use std::{
     collections::{HashMap, HashSet},
     num::NonZeroU16,
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc,
         RwLock,
     },
@@ -52,12 +52,15 @@ pub(crate) struct AuxNetwork {
 
     speaking: SpeakingState,
     last_heartbeat_nonce: Option<u64>,
+    /// Last numbered gateway message (`seq_ack` for v8 heartbeats).
+    last_seq: Option<i32>,
 
     attempt_idx: usize,
     info: ConnectionInfo,
 
     dave_session: Arc<RwLock<Option<davey::DaveSession>>>,
     dave_protocol_version: Arc<AtomicU16>,
+    dave_media_allowed: Arc<AtomicBool>,
     dave_pending_transitions: HashMap<u16, u16>,
     recognized_user_ids: HashSet<UserId>,
 
@@ -75,11 +78,14 @@ impl AuxNetwork {
         info: ConnectionInfo,
         dave_session: Arc<RwLock<Option<davey::DaveSession>>>,
         dave_protocol_version: Arc<AtomicU16>,
+        dave_media_allowed: Arc<AtomicBool>,
         #[cfg(feature = "receive")] ssrc_signalling: Arc<SsrcTracker>,
     ) -> Self {
         let mut recognized_user_ids = HashSet::new();
 
         recognized_user_ids.insert(info.user_id.into());
+
+        let last_seq = ws_client.last_seq();
 
         Self {
             rx: evt_rx,
@@ -91,12 +97,14 @@ impl AuxNetwork {
 
             speaking: SpeakingState::empty(),
             last_heartbeat_nonce: None,
+            last_seq,
 
             attempt_idx,
             info,
 
             dave_session,
             dave_protocol_version,
+            dave_media_allowed,
             dave_pending_transitions: HashMap::new(),
             recognized_user_ids,
 
@@ -134,6 +142,7 @@ impl AuxNetwork {
                     match inner_msg {
                         Ok(WsMessage::Ws(data)) => {
                             self.ws_client = *data;
+                            self.last_seq = self.ws_client.last_seq();
                             next_heartbeat = self.next_heartbeat();
                             self.dont_send = false;
                             self.reassert_speaking().await;
@@ -148,6 +157,12 @@ impl AuxNetwork {
                         Ok(WsMessage::Speaking(is_speaking)) => {
                             if self.speaking.contains(SpeakingState::MICROPHONE) != is_speaking && !self.dont_send {
                                 self.speaking.set(SpeakingState::MICROPHONE, is_speaking);
+                                if is_speaking
+                                    && self.dave_protocol_version.load(Ordering::Relaxed) != 0
+                                    && !self.dave_media_allowed.load(Ordering::Acquire)
+                                {
+                                    continue;
+                                }
                                 info!("Changing to {:?}", self.speaking);
 
                                 let ssu_status = self.ws_client
@@ -192,14 +207,17 @@ impl AuxNetwork {
                         },
                     }
                 }
-                ws_msg = self.ws_client.recv_event_with_timeout(Duration::ZERO), if !self.dont_send => {
+                ws_msg = self.ws_client.recv_event_with_seq_no_timeout(), if !self.dont_send => {
                     ws_error = match ws_msg {
                         Err(e) => {
                             should_reconnect = ws_error_is_not_final(&e);
                             ws_reason = Some((&e).into());
                             true
                         },
-                        Ok(Some(msg)) => {
+                        Ok((Some(msg), seq)) => {
+                            if let Some(s) = seq {
+                                self.last_seq = Some(s as i32);
+                            }
                             match self.process_ws(interconnect, msg).await {
                                 Err(e) => {
                                     should_reconnect = ws_error_is_not_final(&e);
@@ -218,22 +236,8 @@ impl AuxNetwork {
                 self.dont_send = true;
 
                 if should_reconnect {
-                    let is_session_invalid = matches!(
-                        ws_reason,
-                        Some(DisconnectReason::WsClosed(Some(VoiceCloseCode::SessionInvalid)))
-                    );
-
-                    if is_session_invalid {
-                        // 4006 means the voice session is dead; Resume is rejected and only
-                        // Identify (full reconnect) works with the current credentials.
-                        info!(
-                            "WS: SessionInvalid (4006) — triggering full voice reconnect (Identify)"
-                        );
-                        drop(interconnect.core.send(CoreMessage::FullReconnect));
-                        break;
-                    } else {
-                        drop(interconnect.core.send(CoreMessage::Reconnect));
-                    }
+                    info!("WS: attempting in-driver reconnect ({:?})", ws_reason);
+                    drop(interconnect.core.send(CoreMessage::Reconnect));
                 } else {
                     drop(interconnect.core.send(CoreMessage::SignalWsClosure(
                         self.attempt_idx,
@@ -252,6 +256,12 @@ impl AuxNetwork {
 
     async fn reassert_speaking(&mut self) {
         if !self.speaking.contains(SpeakingState::MICROPHONE) || self.dont_send {
+            return;
+        }
+
+        if self.dave_protocol_version.load(Ordering::Relaxed) != 0
+            && !self.dave_media_allowed.load(Ordering::Acquire)
+        {
             return;
         }
 
@@ -278,12 +288,17 @@ impl AuxNetwork {
         let nonce = rand::rng().sample(nonce_range);
         self.last_heartbeat_nonce = Some(nonce);
 
-        trace!("Sent heartbeat {:?}", self.speaking);
+        trace!(
+            "Sent heartbeat speaking={:?} seq_ack={:?}",
+            self.speaking,
+            self.last_seq
+        );
 
         if !self.dont_send {
-            self.ws_client
-                .send_json(&GatewayEvent::from(Heartbeat { nonce }))
-                .await?;
+            // Voice gateway v8 expects `{ "t": nonce, "seq_ack": last_seq }`, not a bare nonce.
+            let seq_ack = self.last_seq.unwrap_or(-1);
+            let payload = format!(r#"{{"op":3,"d":{{"t":{nonce},"seq_ack":{seq_ack}}}}}"#);
+            self.ws_client.send_text(&payload).await?;
         }
 
         Ok(())
@@ -358,7 +373,7 @@ impl AuxNetwork {
                     .insert(ev.transition_id, ev.protocol_version);
 
                 if ev.transition_id == 0 {
-                    self.execute_dave_transition(ev.transition_id);
+                    self.execute_dave_transition(ev.transition_id).await;
                 } else if ev.protocol_version == 0 {
                     if let Some(ref mut dave_session) = *self.dave_session.write().unwrap() {
                         dave_session.set_passthrough_mode(true, Some(120));
@@ -373,7 +388,7 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DaveExecuteTransition(ev) => {
-                self.execute_dave_transition(ev.transition_id);
+                self.execute_dave_transition(ev.transition_id).await;
             },
             GatewayEvent::DavePrepareEpoch(ev) if ev.epoch == 1 => {
                 info!("DAVE: Received DavePrepareEpoch (protocol_version={})", ev.protocol_version);
@@ -395,6 +410,7 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DaveMlsExternalSender(ev) => {
+                info!("DAVE: Received DaveMlsExternalSender ({} bytes)", ev.external_sender.len());
                 if let Some(ref mut dave_session) = *self.dave_session.write().unwrap() {
                     if let Err(e) = dave_session.set_external_sender(&ev.external_sender) {
                         warn!(error = ?e, "error setting MLS external sender");
@@ -550,6 +566,7 @@ impl AuxNetwork {
     }
 
     async fn reinit_dave_session(&mut self) -> Result<(), DaveReinitError> {
+        self.dave_media_allowed.store(false, Ordering::Release);
         let protocol_version = self.dave_protocol_version.load(Ordering::Relaxed);
 
         if let Some(dave_protocol_version) = NonZeroU16::new(protocol_version) {
@@ -583,7 +600,7 @@ impl AuxNetwork {
         Ok(())
     }
 
-    fn execute_dave_transition(&mut self, transition_id: u16) {
+    async fn execute_dave_transition(&mut self, transition_id: u16) {
         let Some(new_version) = self.dave_pending_transitions.get(&transition_id).copied() else {
             warn!("Received DaveExecuteTransition for unknown transition ID {transition_id}");
             return;
@@ -601,6 +618,24 @@ impl AuxNetwork {
         }
 
         self.dave_pending_transitions.remove(&transition_id);
+        self.dave_media_allowed.store(true, Ordering::Release);
+
+        // Re-assert speaking now that DAVE allows media — the earlier speaking
+        // packet was deferred because dave_media_allowed was false.
+        if self.speaking.contains(SpeakingState::MICROPHONE) && !self.dont_send {
+            if let Err(e) = self
+                .ws_client
+                .send_json(&GatewayEvent::from(Speaking {
+                    delay: Some(0),
+                    speaking: self.speaking,
+                    ssrc: self.ssrc,
+                    user_id: None,
+                }))
+                .await
+            {
+                warn!("WS: Failed to re-assert speaking after DAVE transition: {:?}", e);
+            }
+        }
     }
 }
 

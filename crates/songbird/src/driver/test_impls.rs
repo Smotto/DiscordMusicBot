@@ -20,7 +20,7 @@ use std::{
     io::Cursor,
     net::UdpSocket,
     num::NonZeroU16,
-    sync::{atomic::AtomicU16, Arc, RwLock},
+    sync::{atomic::{AtomicBool, AtomicU16}, Arc, RwLock},
 };
 use tokio::runtime::Handle;
 
@@ -71,6 +71,7 @@ impl Mixer {
         let cipher = mode.cipher_from_key(&[0u8; 32]).unwrap();
         let crypto_state = mode.into();
         let dave_protocol_version = Arc::new(AtomicU16::new(davey::DAVE_PROTOCOL_VERSION));
+        let dave_media_allowed = Arc::new(AtomicBool::new(true));
         let dave_session = Arc::new(RwLock::new(Some(
             davey::DaveSession::new(
                 NonZeroU16::new(1).expect("failed to initialize NonZeroU16 from static value"),
@@ -87,6 +88,7 @@ impl Mixer {
             crypto_state,
             dave_session,
             dave_protocol_version,
+            dave_media_allowed,
             udp_rx: udp_receiver_tx,
             udp_tx,
         };
@@ -97,6 +99,7 @@ impl Mixer {
             crypto_state,
             dave_session,
             dave_protocol_version,
+            dave_media_allowed,
             udp_tx,
         };
 

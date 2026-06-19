@@ -60,6 +60,7 @@ async fn runner(mut config: Config, rx: Receiver<CoreMessage>, tx: Sender<CoreMe
     let mut interconnect = start_internals(tx, &config);
     let mut retrying = None;
     let mut attempt_idx = 0;
+    let mut pending_reconnect_info: Option<ConnectionInfo> = None;
 
     while let Ok(msg) = rx.recv_async().await {
         match msg {
@@ -214,20 +215,27 @@ async fn runner(mut config: Config, rx: Receiver<CoreMessage>, tx: Sender<CoreMe
                     }
                 }
             },
-            CoreMessage::FullReconnect => {
+            CoreMessage::FullReconnect(info_override) => {
                 info!("FullReconnect requested");
-                if let Some(conn) = connection.take() {
-                    info!("FullReconnect: old connection dropped, starting fresh connect");
-                    let info = conn.info.clone();
-
-                    let result = ConnectionRetryData::reconnect(info, &mut attempt_idx)
-                        .attempt(&mut retrying, &interconnect, &config)
-                        .await;
-                    info!("FullReconnect: result={:?}", result.is_some());
-                    connection = result;
+                let info = if let Some(conn) = connection.take() {
+                    pending_reconnect_info = None;
+                    info_override.unwrap_or_else(|| conn.info.clone())
+                } else if let Some(info) = info_override {
+                    pending_reconnect_info = None;
+                    info
+                } else if let Some(info) = pending_reconnect_info.take() {
+                    info
                 } else {
-                    info!("FullReconnect: no existing connection, skipping");
-                }
+                    info!("FullReconnect: no existing connection and no info, skipping");
+                    continue;
+                };
+
+                info!("FullReconnect: starting fresh connect");
+                let result = ConnectionRetryData::reconnect(info, &mut attempt_idx)
+                    .attempt(&mut retrying, &interconnect, &config)
+                    .await;
+                info!("FullReconnect: result={:?}", result.is_some());
+                connection = result;
             }
             CoreMessage::RebuildInterconnect => {
                 interconnect.restart_volatile_internals();

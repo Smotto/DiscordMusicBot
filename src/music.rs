@@ -14,9 +14,10 @@ use songbird::input::core::io::{MediaSource, ReadOnlySource};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Playback volume on the track handle. Keep at 1.0 so songbird can Opus-passthrough;
-/// loudness is normalized in the ffmpeg filter chain instead.
-const PLAYBACK_VOLUME: f32 = 1.0;
+/// Slightly below 1.0 so songbird decodes and re-encodes through its Opus encoder.
+/// Passthrough + DAVE E2E encryption triggers session invalidation (~8s in).
+/// Loudness is normalized in the ffmpeg filter chain instead.
+const PLAYBACK_VOLUME: f32 = 0.99;
 
 struct LogTrackEvents;
 
@@ -45,7 +46,8 @@ impl SongbirdEventHandler for LogVoiceEvents {
         match ctx {
             EventContext::DriverDisconnect(data) => {
                 tracing::warn!(
-                    "Voice driver disconnected: kind={:?} reason={:?}",
+                    "Voice driver disconnected: guild={} kind={:?} reason={:?}",
+                    data.guild_id,
                     data.kind,
                     data.reason
                 );
@@ -142,7 +144,7 @@ async fn ytdlp_ffmpeg_input(query: &str, is_url: bool) -> Result<songbird::input
         .map_err(|e| format!("Audio pipeline task failed: {e}"))?
 }
 
-/// Reads from the ffmpeg stdout until an Ogg page header is available so symphonia
+/// Reads from the ffmpeg stdout until a WAV header (RIFF) is available so songbird
 /// does not probe an empty pipe (`probe reach EOF at 0 bytes`).
 struct PrefixedPipe {
     prefix: Cursor<Vec<u8>>,
@@ -357,7 +359,11 @@ pub async fn diagnose_voice_channel(
     Ok(())
 }
 
-fn register_track_events(handler: &mut Call, registered: &mut HashSet<u64>, guild_id: GuildId) {
+fn register_track_events(
+    handler: &mut Call,
+    registered: &mut HashSet<u64>,
+    guild_id: GuildId,
+) {
     if !registered.insert(guild_id.get()) {
         return;
     }
@@ -448,6 +454,7 @@ async fn ensure_in_voice(
         let mut call = handle.lock().await;
         if call.current_channel() == Some(channel_id.into()) {
             register_track_events(&mut call, registered, guild_id);
+            call.reconnect_voice_driver_if_inactive();
             return Ok(());
         }
         drop(call);
@@ -495,6 +502,18 @@ pub async fn play(
         .ok_or("Voice handler missing after join.")?;
 
     let mut handler = handler_lock.lock().await;
+    if !handler.is_voice_driver_active() {
+        tracing::info!("Voice driver inactive before enqueue — reconnecting");
+        if !handler.reconnect_voice_driver_if_inactive() {
+            return Err(
+                "Voice connection was lost. Use /join again, then /play.".into(),
+            );
+        }
+        drop(handler);
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        handler = handler_lock.lock().await;
+    }
+
     let track_handle = handler.enqueue(track).await;
     tracing::info!("Enqueued track: {title} (yt-dlp→ffmpeg pipe)");
 

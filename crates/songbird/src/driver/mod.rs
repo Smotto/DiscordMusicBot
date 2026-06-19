@@ -147,6 +147,11 @@ impl Driver {
         self.send(CoreMessage::UpdateConnectionInfo(info));
     }
 
+    /// Tear down and rebuild the voice driver using the given connection info.
+    pub(crate) fn full_reconnect(&mut self, info: ConnectionInfo) {
+        self.send(CoreMessage::FullReconnect(Some(info)));
+    }
+
     /// Leaves the current voice channel, disconnecting from it.
     ///
     /// This does *not* forget settings, like whether to be self-deafened or

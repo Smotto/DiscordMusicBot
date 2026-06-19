@@ -1,5 +1,6 @@
 use std::{
     marker::PhantomData,
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -216,6 +217,15 @@ impl ParkedMixer {
     }
 
     pub fn send_gateway_speaking(&mut self) -> Result<(), ()> {
+        // Defer speaking if DAVE is active but media is not yet allowed —
+        // Discord will reject unencrypted speaking packets.
+        if let Some(conn) = &self.mixer.conn_active {
+            if conn.dave_protocol_version.load(Ordering::Relaxed) != 0
+                && !conn.dave_media_allowed.load(Ordering::Acquire)
+            {
+                return Ok(());
+            }
+        }
         if let Err(e) = self.mixer.send_gateway_speaking() {
             self.mixer
                 .do_rebuilds(

@@ -26,7 +26,7 @@ use error::{Error, Result};
 use flume::Sender;
 use serenity_voice_model::payload::DaveMlsKeyPackage;
 use socket2::Socket;
-use std::sync::{atomic::AtomicU16, Arc, RwLock};
+use std::sync::{atomic::{AtomicBool, AtomicU16}, Arc, RwLock};
 use std::{net::IpAddr, num::NonZeroU16, str::FromStr};
 use tokio::{net::UdpSocket, spawn, time::timeout};
 use tracing::{debug, info, instrument};
@@ -190,6 +190,7 @@ impl Connection {
             init_cipher(&mut client, &info, chosen_crypto, &ws_msg_tx).await?;
         let dave_session = Arc::new(RwLock::new(dave_session));
         let dave_protocol_version = Arc::new(dave_protocol_version);
+        let dave_media_allowed = Arc::new(AtomicBool::new(false));
 
         // NOTE: This causes the UDP Socket on "receive" to be non-blocking,
         // and the standard to be blocking. A UDP send should only WouldBlock if
@@ -226,6 +227,7 @@ impl Connection {
             cipher,
             dave_session: dave_session.clone(),
             dave_protocol_version: dave_protocol_version.clone(),
+            dave_media_allowed: dave_media_allowed.clone(),
             crypto_state: chosen_crypto.into(),
             #[cfg(feature = "receive")]
             udp_rx: udp_receiver_msg_tx,
@@ -254,6 +256,7 @@ impl Connection {
             info.clone(),
             dave_session.clone(),
             dave_protocol_version.clone(),
+            dave_media_allowed.clone(),
             #[cfg(feature = "receive")]
             ssrc_tracker.clone(),
         );
