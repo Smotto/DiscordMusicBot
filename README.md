@@ -54,6 +54,7 @@ cargo run
 
 | Command | Description |
 |---------|-------------|
+| `/join` | Join your current voice channel |
 | `/play <query>` | Play a song (YouTube URL or search query) |
 | `/skip` | Skip to the next song in queue |
 | `/pause` | Pause the current song |
@@ -64,4 +65,10 @@ cargo run
 
 - **serenity** `EventHandler` (no poise) — same pattern as DiscordTranslator
 - **songbird** from `crates/songbird` — vendored fork with voice gateway fixes
-- **yt-dlp** via Songbird's `YoutubeDl` input for playback
+- **yt-dlp** → **ffmpeg** → Songbird for playback (Ogg/Opus pipe)
+
+## Voice / DAVE troubleshooting
+
+Discord voice now requires **DAVE** end-to-end encryption and **voice gateway v8** heartbeats. Our Songbird fork includes patches for both.
+
+If you hit `4006 SessionInvalid`, dropouts, or channel flicker, see **[docs/voice-dave-fixes.md](docs/voice-dave-fixes.md)** for diagnosis and what we changed.
