@@ -1,3 +1,6 @@
+use crate::audio_pipe::{buffer_initial_ogg, PrefixedPipe};
+use crate::playback::{GuildPlayback, PlaybackModes};
+
 use serenity::all::{
     ChannelId, CommandDataOptionValue, CommandInteraction, Context, GuildId, Permissions,
     UserId,
@@ -5,19 +8,140 @@ use serenity::all::{
 use songbird::events::{CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler, TrackEvent};
 use songbird::input::{AudioStream, ChildContainer, Compose, Input, LiveInput, YoutubeDl};
 use songbird::input::codecs::{get_codec_registry, get_probe};
+use songbird::input::core::io::{MediaSource, ReadOnlySource};
 use songbird::tracks::{PlayMode, Track};
 use songbird::{Call, Event as SongbirdEvent, Songbird};
-use std::collections::HashSet;
-use std::io::{Cursor, ErrorKind, Read};
+use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::process::Stdio;
-use songbird::input::core::io::{MediaSource, ReadOnlySource};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+
+/// Leave voice if nothing is queued or playing for this long.
+const VOICE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Slightly below 1.0 so songbird decodes and re-encodes through its Opus encoder.
 /// Passthrough + DAVE E2E encryption triggers session invalidation (~8s in).
 /// Loudness is normalized in the ffmpeg filter chain instead.
-const PLAYBACK_VOLUME: f32 = 0.99;
+pub const PLAYBACK_VOLUME: f32 = 0.99;
+
+pub struct VoiceIdleManager {
+    timers: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    playback_modes: Arc<PlaybackModes>,
+}
+
+impl VoiceIdleManager {
+    pub fn new(playback_modes: Arc<PlaybackModes>) -> Arc<Self> {
+        Arc::new(Self {
+            timers: Mutex::new(HashMap::new()),
+            playback_modes,
+        })
+    }
+
+    pub async fn cancel(&self, guild_id: GuildId) {
+        if let Some(handle) = self.timers.lock().await.remove(&guild_id.get()) {
+            handle.abort();
+        }
+    }
+
+    pub fn playback_modes(&self) -> Arc<PlaybackModes> {
+        self.playback_modes.clone()
+    }
+
+    pub async fn schedule(
+        self: &Arc<Self>,
+        songbird: Arc<Songbird>,
+        guild_id: GuildId,
+        registered: Arc<Mutex<HashSet<u64>>>,
+    ) {
+        self.cancel(guild_id).await;
+
+        let idle = Arc::clone(self);
+        let playback_modes = self.playback_modes.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(VOICE_IDLE_TIMEOUT).await;
+            if !is_voice_idle(&songbird, guild_id, &playback_modes).await {
+                return;
+            }
+            tracing::info!(
+                "No playback for {} minutes in guild {guild_id} — leaving voice channel",
+                VOICE_IDLE_TIMEOUT.as_secs() / 60
+            );
+            idle_disconnect(&songbird, guild_id, &registered).await;
+            idle.cancel(guild_id).await;
+        });
+
+        self.timers
+            .lock()
+            .await
+            .insert(guild_id.get(), handle.abort_handle());
+    }
+}
+
+async fn is_voice_idle(
+    songbird: &Arc<Songbird>,
+    guild_id: GuildId,
+    playback_modes: &PlaybackModes,
+) -> bool {
+    if playback_modes.get(guild_id).await == GuildPlayback::Spotify {
+        return false;
+    }
+
+    let Some(handler_lock) = songbird.get(guild_id) else {
+        return false;
+    };
+    let handler = handler_lock.lock().await;
+    handler.current_channel().is_some() && handler.queue().is_empty()
+}
+
+async fn idle_disconnect(
+    songbird: &Arc<Songbird>,
+    guild_id: GuildId,
+    registered: &Arc<Mutex<HashSet<u64>>>,
+) {
+    let Some(handler_lock) = songbird.get(guild_id) else {
+        return;
+    };
+    {
+        let mut handler = handler_lock.lock().await;
+        handler.queue().stop();
+        handler.stop();
+    }
+    match songbird.leave(guild_id).await {
+        Ok(()) => tracing::info!("Left voice channel in guild {guild_id} (idle timeout)"),
+        Err(e) => tracing::warn!("Idle leave failed for guild {guild_id}: {e}"),
+    }
+    registered.lock().await.remove(&guild_id.get());
+}
+
+struct IdleDisconnectOnEnd {
+    songbird: Arc<Songbird>,
+    guild_id: GuildId,
+    idle: Arc<VoiceIdleManager>,
+    registered: Arc<Mutex<HashSet<u64>>>,
+    playback_modes: Arc<PlaybackModes>,
+}
+
+#[async_trait::async_trait]
+impl SongbirdEventHandler for IdleDisconnectOnEnd {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<SongbirdEvent> {
+        let songbird = self.songbird.clone();
+        let guild_id = self.guild_id;
+        let idle = self.idle.clone();
+        let registered = self.registered.clone();
+        let playback_modes = self.playback_modes.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if is_voice_idle(&songbird, guild_id, &playback_modes).await {
+                idle.schedule(songbird, guild_id, registered).await;
+            }
+        });
+
+        None
+    }
+}
 
 struct LogTrackEvents;
 
@@ -144,65 +268,6 @@ async fn ytdlp_ffmpeg_input(query: &str, is_url: bool) -> Result<songbird::input
         .map_err(|e| format!("Audio pipeline task failed: {e}"))?
 }
 
-/// Reads from the ffmpeg stdout until a WAV header (RIFF) is available so songbird
-/// does not probe an empty pipe (`probe reach EOF at 0 bytes`).
-struct PrefixedPipe {
-    prefix: Cursor<Vec<u8>>,
-    pipe: ChildContainer,
-}
-
-impl Read for PrefixedPipe {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.prefix.read(buf)?;
-        if n > 0 {
-            return Ok(n);
-        }
-        self.pipe.read(buf)
-    }
-}
-
-fn buffer_initial_ogg(container: &mut ChildContainer) -> Result<Vec<u8>, String> {
-    const MIN_BYTES: usize = 4096;
-    const TIMEOUT: Duration = Duration::from_secs(45);
-
-    let start = std::time::Instant::now();
-    let mut buf = vec![0u8; MIN_BYTES];
-    let mut filled = 0usize;
-
-    while filled < MIN_BYTES {
-        if start.elapsed() > TIMEOUT {
-            return Err(
-                "Timed out waiting for audio from yt-dlp/ffmpeg (no Ogg data on stdout).".into(),
-            );
-        }
-
-        match container.read(&mut buf[filled..]) {
-            Ok(0) => {
-                if filled >= 4 && buf[..filled].starts_with(b"OggS") {
-                    buf.truncate(filled);
-                    return Ok(buf);
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Ok(n) => {
-                filled += n;
-                if filled >= 4 && buf[..4] != *b"OggS" {
-                    return Err("ffmpeg pipe did not produce Ogg/Opus output.".into());
-                }
-                if filled >= MIN_BYTES {
-                    buf.truncate(filled);
-                    return Ok(buf);
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(format!("Error reading ffmpeg pipe: {e}")),
-        }
-    }
-
-    buf.truncate(filled);
-    Ok(buf)
-}
-
 fn spawn_ytdlp_ffmpeg_pipeline(target: &str) -> Result<Input, String> {
     let mut ytdl = std::process::Command::new("yt-dlp");
     ytdl.args([
@@ -280,10 +345,7 @@ fn spawn_ytdlp_ffmpeg_pipeline(target: &str) -> Result<Input, String> {
         prefix.len()
     );
 
-    let prefixed = PrefixedPipe {
-        prefix: Cursor::new(prefix),
-        pipe: container,
-    };
+    let prefixed = PrefixedPipe::new(prefix, container);
     let audio_stream = AudioStream {
         input: Box::new(ReadOnlySource::new(prefixed)) as Box<dyn MediaSource>,
     };
@@ -359,14 +421,18 @@ pub async fn diagnose_voice_channel(
     Ok(())
 }
 
-fn register_track_events(
+async fn register_track_events(
     handler: &mut Call,
-    registered: &mut HashSet<u64>,
+    registered: &Arc<Mutex<HashSet<u64>>>,
     guild_id: GuildId,
+    songbird: Arc<Songbird>,
+    idle: Arc<VoiceIdleManager>,
 ) {
-    if !registered.insert(guild_id.get()) {
+    let mut set = registered.lock().await;
+    if !set.insert(guild_id.get()) {
         return;
     }
+    drop(set);
 
     handler.add_global_event(
         Event::Track(TrackEvent::Error),
@@ -378,6 +444,16 @@ fn register_track_events(
     );
     handler.add_global_event(Event::Track(TrackEvent::Play), LogTrackEvents);
     handler.add_global_event(Event::Track(TrackEvent::End), LogTrackEvents);
+    handler.add_global_event(
+        Event::Track(TrackEvent::End),
+        IdleDisconnectOnEnd {
+            songbird,
+            guild_id,
+            idle: idle.clone(),
+            registered: registered.clone(),
+            playback_modes: idle.playback_modes(),
+        },
+    );
     handler.add_global_event(
         Event::Core(CoreEvent::DriverDisconnect),
         LogVoiceEvents,
@@ -392,7 +468,8 @@ pub async fn join_voice(
     songbird: &Arc<Songbird>,
     guild_id: GuildId,
     channel_id: ChannelId,
-    registered: &mut HashSet<u64>,
+    registered: Arc<Mutex<HashSet<u64>>>,
+    idle: Arc<VoiceIdleManager>,
 ) -> Result<(), String> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
@@ -400,8 +477,9 @@ pub async fn join_voice(
     for attempt in 1..=MAX_ATTEMPTS {
         if songbird.get(guild_id).is_some() {
             tracing::info!("Clearing stale call before join attempt {attempt}");
+            idle.cancel(guild_id).await;
             songbird.remove(guild_id).await.ok();
-            registered.remove(&guild_id.get());
+            registered.lock().await.remove(&guild_id.get());
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
 
@@ -416,17 +494,26 @@ pub async fn join_voice(
             Ok(Ok(handle)) => {
                 {
                     let mut call = handle.lock().await;
-                    register_track_events(&mut call, registered, guild_id);
+                    register_track_events(
+                        &mut call,
+                        &registered,
+                        guild_id,
+                        songbird.clone(),
+                        idle.clone(),
+                    )
+                    .await;
                 }
                 tracing::info!("Joined voice channel {channel_id} in guild {guild_id}");
+                idle.schedule(songbird.clone(), guild_id, registered).await;
                 return Ok(());
             }
             Ok(Err(e)) => {
                 last_err = e.to_string();
                 tracing::warn!("Join attempt {attempt} failed: {last_err}");
                 if attempt < MAX_ATTEMPTS && e.should_leave_server() {
+                    idle.cancel(guild_id).await;
                     songbird.remove(guild_id).await.ok();
-                    registered.remove(&guild_id.get());
+                    registered.lock().await.remove(&guild_id.get());
                     tokio::time::sleep(Duration::from_millis(1500)).await;
                 }
             }
@@ -444,23 +531,63 @@ pub async fn join_voice(
     ))
 }
 
-async fn ensure_in_voice(
+pub async fn ensure_in_voice(
     songbird: &Arc<Songbird>,
     guild_id: GuildId,
     channel_id: ChannelId,
-    registered: &mut HashSet<u64>,
+    registered: Arc<Mutex<HashSet<u64>>>,
+    idle: Arc<VoiceIdleManager>,
 ) -> Result<(), String> {
     if let Some(handle) = songbird.get(guild_id) {
         let mut call = handle.lock().await;
         if call.current_channel() == Some(channel_id.into()) {
-            register_track_events(&mut call, registered, guild_id);
+            register_track_events(
+                &mut call,
+                &registered,
+                guild_id,
+                songbird.clone(),
+                idle.clone(),
+            )
+            .await;
             call.reconnect_voice_driver_if_inactive();
             return Ok(());
         }
         drop(call);
     }
 
-    join_voice(songbird, guild_id, channel_id, registered).await
+    join_voice(songbird, guild_id, channel_id, registered, idle).await
+}
+
+/// Poll until the voice driver reports an active UDP/WebSocket session.
+pub async fn wait_for_voice_driver(
+    songbird: &Arc<Songbird>,
+    guild_id: GuildId,
+    timeout: Duration,
+) -> Result<(), String> {
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    let mut consecutive = 0u32;
+
+    while Instant::now() < deadline {
+        if let Some(handle) = songbird.get(guild_id) {
+            let call = handle.lock().await;
+            if call.is_voice_driver_active() {
+                consecutive += 1;
+                if consecutive >= 5 {
+                    tracing::info!("Voice driver active for guild {guild_id}");
+                    return Ok(());
+                }
+            } else {
+                consecutive = 0;
+            }
+        } else {
+            consecutive = 0;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err("Voice driver did not become active in time.".into())
 }
 
 pub async fn play(
@@ -469,11 +596,28 @@ pub async fn play(
     channel_id: ChannelId,
     query: String,
     http_client: reqwest::Client,
-    registered: &mut HashSet<u64>,
+    registered: Arc<Mutex<HashSet<u64>>>,
+    idle: Arc<VoiceIdleManager>,
+    stream_sessions: &Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
 ) -> Result<String, String> {
     require_ytdlp().await?;
     require_ffmpeg().await?;
-    ensure_in_voice(&songbird, guild_id, channel_id, registered).await?;
+
+    // Clear an active Spotify capture session before YouTube enqueue.
+    if stream_sessions.lock().await.contains_key(&guild_id.get()) {
+        crate::stream::stop_guild_stream(&songbird, guild_id, stream_sessions)
+            .await
+            .ok();
+    }
+
+    ensure_in_voice(
+        &songbird,
+        guild_id,
+        channel_id,
+        registered.clone(),
+        idle.clone(),
+    )
+    .await?;
 
     let is_url = query.starts_with("http");
     let mut ytdl = if is_url {
@@ -516,6 +660,7 @@ pub async fn play(
 
     let track_handle = handler.enqueue(track).await;
     tracing::info!("Enqueued track: {title} (yt-dlp→ffmpeg pipe)");
+    idle.cancel(guild_id).await;
 
     match track_handle.get_info().await {
         Ok(info) => tracing::debug!("Track info after enqueue: {:?}", info.playing),
@@ -558,7 +703,15 @@ pub async fn resume(songbird: &Arc<Songbird>, guild_id: GuildId) -> Result<(), S
         .map_err(|e| format!("Resume failed: {e}"))
 }
 
-pub async fn stop(songbird: &Arc<Songbird>, guild_id: GuildId) -> Result<(), String> {
+/// Stop playback and leave voice (legacy; prefer [`stop_all`] for unified shutdown).
+#[allow(dead_code)]
+pub async fn stop(
+    songbird: &Arc<Songbird>,
+    guild_id: GuildId,
+    registered: Arc<Mutex<HashSet<u64>>>,
+    idle: Arc<VoiceIdleManager>,
+) -> Result<(), String> {
+    idle.cancel(guild_id).await;
     let handler_lock = songbird
         .get(guild_id)
         .ok_or("I'm not connected to a voice channel.")?;
@@ -569,7 +722,43 @@ pub async fn stop(songbird: &Arc<Songbird>, guild_id: GuildId) -> Result<(), Str
     songbird
         .leave(guild_id)
         .await
-        .map_err(|e| format!("Failed to leave voice channel: {e}"))
+        .map_err(|e| format!("Failed to leave voice channel: {e}"))?;
+    registered.lock().await.remove(&guild_id.get());
+    Ok(())
+}
+
+/// Stop all playback (YouTube + Spotify stream), leave voice, and set mode to Idle.
+pub async fn stop_all(
+    songbird: &Arc<Songbird>,
+    guild_id: GuildId,
+    registered: Arc<Mutex<HashSet<u64>>>,
+    idle: Arc<VoiceIdleManager>,
+    stream_sessions: &Arc<Mutex<std::collections::HashMap<u64, crate::stream::StreamSession>>>,
+    playback_modes: &Arc<crate::playback::PlaybackModes>,
+) -> Result<(), String> {
+    crate::stream::stop_guild_stream(songbird, guild_id, stream_sessions)
+        .await
+        .ok();
+
+    idle.cancel(guild_id).await;
+    playback_modes
+        .set(guild_id, crate::playback::GuildPlayback::Idle)
+        .await;
+
+    if let Some(handler_lock) = songbird.get(guild_id) {
+        let mut handler = handler_lock.lock().await;
+        handler.queue().stop();
+        handler.stop();
+    }
+
+    if songbird.get(guild_id).is_some() {
+        if let Err(e) = songbird.leave(guild_id).await {
+            tracing::warn!("Failed to leave voice channel in guild {guild_id}: {e}");
+        }
+    }
+
+    registered.lock().await.remove(&guild_id.get());
+    Ok(())
 }
 
 pub fn option_string(cmd: &CommandInteraction, name: &str) -> Option<String> {
@@ -580,4 +769,29 @@ pub fn option_string(cmd: &CommandInteraction, name: &str) -> Option<String> {
             None
         }
     })
+}
+
+/// Read a string option from a slash subcommand (e.g. `/spotify play url:...`).
+pub fn subcommand_option_string(
+    cmd: &CommandInteraction,
+    subcommand: &str,
+    name: &str,
+) -> Option<String> {
+    cmd.data
+        .options
+        .iter()
+        .find(|o| o.name == subcommand)
+        .and_then(|o| {
+            if let CommandDataOptionValue::SubCommand(sub) = &o.value {
+                sub.iter().find(|o| o.name == name).and_then(|o| {
+                    if let CommandDataOptionValue::String(value) = &o.value {
+                        Some(value.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        })
 }

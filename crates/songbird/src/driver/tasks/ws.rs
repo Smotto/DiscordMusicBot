@@ -369,6 +369,10 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DavePrepareTransition(ev) => {
+                info!(
+                    "DAVE: Received DavePrepareTransition (transition_id={}, protocol_version={})",
+                    ev.transition_id, ev.protocol_version
+                );
                 self.dave_pending_transitions
                     .insert(ev.transition_id, ev.protocol_version);
 
@@ -388,6 +392,10 @@ impl AuxNetwork {
                 }
             },
             GatewayEvent::DaveExecuteTransition(ev) => {
+                info!(
+                    "DAVE: Received DaveExecuteTransition (transition_id={})",
+                    ev.transition_id
+                );
                 self.execute_dave_transition(ev.transition_id).await;
             },
             GatewayEvent::DavePrepareEpoch(ev) if ev.epoch == 1 => {
@@ -450,11 +458,27 @@ impl AuxNetwork {
                     info!("DAVE: Sending DaveMlsCommitWelcome");
                     self.ws_client
                         .send_binary(&GatewayEvent::from(DaveMlsCommitWelcome {
-                            commit: commit_welcome.commit,
-                            welcome: commit_welcome.welcome,
+                            commit: commit_welcome.commit.clone(),
+                            welcome: commit_welcome.welcome.clone(),
                         }))
                         .await?;
                     info!("DAVE: DaveMlsCommitWelcome sent successfully");
+
+                    // As committer, merge our pending MLS commit locally. Discord may not
+                    // send AnnounceCommitTransition promptly (or at all for transition_id 0).
+                    if let Some(ref mut dave_session) = *self.dave_session.write().unwrap() {
+                        match dave_session.process_commit(&commit_welcome.commit) {
+                            Ok(()) => info!(
+                                "DAVE: Local commit merged after CommitWelcome, is_ready={}",
+                                dave_session.is_ready()
+                            ),
+                            Err(e) => warn!(
+                                error = ?e,
+                                "DAVE: local process_commit after CommitWelcome failed"
+                            ),
+                        }
+                    }
+                    self.try_enable_dave_media().await;
                 } else {
                     info!("DAVE: process_proposals returned None (no commit/welcome to send)");
                 }
@@ -466,35 +490,64 @@ impl AuxNetwork {
                 info!("DAVE: After proposals, is_ready={}", is_ready);
             },
             GatewayEvent::DaveMlsAnnounceCommitTransition(ev) => {
-                match self.dave_process_commit(&ev.commit_message) {
-                    Some(Ok(())) if ev.transition_id != 0 => {
-                        let protocol_version = self.dave_protocol_version.load(Ordering::Relaxed);
+                let already_ready = self
+                    .dave_session
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|s| s.is_ready());
 
-                        self.dave_pending_transitions
-                            .insert(ev.transition_id, protocol_version);
-                        self.ws_client
-                            .send_json(&GatewayEvent::from(DaveTransitionReady {
-                                transition_id: ev.transition_id,
-                                protocol_version,
-                            }))
-                            .await?;
-                    },
-                    Some(Err(e)) => {
-                        warn!("MLS commit errored: {e:?}");
-                        self.ws_client
-                            .send_json(&GatewayEvent::from(DaveMlsInvalidCommitWelcome {
-                                transition_id: ev.transition_id,
-                            }))
-                            .await?;
-                        match self.reinit_dave_session().await {
-                            Err(DaveReinitError::Ws(e)) => return Err(e),
-                            Err(e) => {
-                                warn!(error = ?e, "failed to reinitialize DAVE session");
-                            },
-                            _ => {},
-                        }
-                    },
-                    Some(Ok(())) | None => {},
+                if already_ready {
+                    tracing::debug!(
+                        "DAVE: Ignoring AnnounceCommitTransition (transition_id={}) — already merged locally",
+                        ev.transition_id
+                    );
+                } else {
+                    info!(
+                        "DAVE: Received DaveMlsAnnounceCommitTransition (transition_id={})",
+                        ev.transition_id
+                    );
+                    match self.dave_process_commit(&ev.commit_message) {
+                        Some(Ok(())) if ev.transition_id != 0 => {
+                            let protocol_version =
+                                self.dave_protocol_version.load(Ordering::Relaxed);
+
+                            self.dave_pending_transitions
+                                .insert(ev.transition_id, protocol_version);
+                            self.ws_client
+                                .send_json(&GatewayEvent::from(DaveTransitionReady {
+                                    transition_id: ev.transition_id,
+                                    protocol_version,
+                                }))
+                                .await?;
+                        },
+                        Some(Ok(())) => {
+                            info!("DAVE: Commit processed for transition_id=0");
+                            self.try_enable_dave_media().await;
+                        },
+                        Some(Err(e)) if is_stale_dave_commit_error(&e) => {
+                            tracing::debug!(
+                                "DAVE: Stale commit announcement ignored: {e:?}"
+                            );
+                            self.try_enable_dave_media().await;
+                        },
+                        Some(Err(e)) => {
+                            warn!("MLS commit errored: {e:?}");
+                            self.ws_client
+                                .send_json(&GatewayEvent::from(DaveMlsInvalidCommitWelcome {
+                                    transition_id: ev.transition_id,
+                                }))
+                                .await?;
+                            match self.reinit_dave_session().await {
+                                Err(DaveReinitError::Ws(e)) => return Err(e),
+                                Err(e) => {
+                                    warn!(error = ?e, "failed to reinitialize DAVE session");
+                                },
+                                _ => {},
+                            }
+                        },
+                        None => {},
+                    }
                 }
             },
             GatewayEvent::DaveMlsWelcome(ev) => {
@@ -513,6 +566,14 @@ impl AuxNetwork {
                             .await?;
                     },
 
+                    Some(Err(e))
+                        if matches!(
+                            e,
+                            davey::errors::ProcessWelcomeError::AlreadyInGroup
+                        ) =>
+                    {
+                        tracing::debug!("DAVE: Welcome ignored — already in MLS group");
+                    },
                     Some(Err(e)) => {
                         warn!("MLS welcome errored: {e:?}");
                         self.ws_client
@@ -528,7 +589,11 @@ impl AuxNetwork {
                             _ => {},
                         }
                     },
-                    Some(Ok(())) | None => {},
+                    Some(Ok(())) => {
+                        info!("DAVE: Welcome processed for transition_id={}", ev.transition_id);
+                        self.try_enable_dave_media().await;
+                    },
+                    None => {},
                 }
                 let is_ready = if let Some(ref ds) = *self.dave_session.read().unwrap() {
                     ds.is_ready()
@@ -536,6 +601,9 @@ impl AuxNetwork {
                     false
                 };
                 info!("DAVE: After welcome, is_ready={}", is_ready);
+                if is_ready {
+                    self.try_enable_dave_media().await;
+                }
             },
             other => {
                 trace!("Received other websocket data: {:?}", other);
@@ -600,9 +668,41 @@ impl AuxNetwork {
         Ok(())
     }
 
+    /// Unblock RTP once the MLS session can encrypt and Discord allows media.
+    async fn try_enable_dave_media(&mut self) {
+        let is_ready = self
+            .dave_session
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.is_ready());
+        if !is_ready {
+            return;
+        }
+        if self.dave_media_allowed.load(Ordering::Acquire) {
+            return;
+        }
+        let protocol_version = self.dave_protocol_version.load(Ordering::Relaxed);
+        self.dave_pending_transitions.insert(0, protocol_version);
+        self.execute_dave_transition(0).await;
+        info!("DAVE: Media enabled (session is_ready=true)");
+    }
+
     async fn execute_dave_transition(&mut self, transition_id: u16) {
         let Some(new_version) = self.dave_pending_transitions.get(&transition_id).copied() else {
             warn!("Received DaveExecuteTransition for unknown transition ID {transition_id}");
+            let is_ready = self
+                .dave_session
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|s| s.is_ready());
+            if is_ready && !self.dave_media_allowed.load(Ordering::Acquire) {
+                self.dave_media_allowed.store(true, Ordering::Release);
+                info!(
+                    "DAVE: RTP media allowed (fallback, unknown transition_id={transition_id})"
+                );
+            }
             return;
         };
         let old_version = self.dave_protocol_version.load(Ordering::Relaxed);
@@ -619,6 +719,7 @@ impl AuxNetwork {
 
         self.dave_pending_transitions.remove(&transition_id);
         self.dave_media_allowed.store(true, Ordering::Release);
+        info!("DAVE: RTP media allowed (transition_id={transition_id})");
 
         // Re-assert speaking now that DAVE allows media — the earlier speaking
         // packet was deferred because dave_media_allowed was false.
@@ -644,6 +745,10 @@ pub(crate) async fn runner(mut interconnect: Interconnect, mut aux: AuxNetwork) 
     trace!("WS thread started.");
     aux.run(&mut interconnect).await;
     trace!("WS thread finished.");
+}
+
+fn is_stale_dave_commit_error(err: &davey::errors::ProcessCommitError) -> bool {
+    format!("{err:?}").contains("WrongEpoch")
 }
 
 fn ws_error_is_not_final(err: &WsError) -> bool {

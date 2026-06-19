@@ -1,5 +1,10 @@
+mod audio_pipe;
 mod bot;
 mod music;
+mod playback;
+mod smtc;
+mod spotify;
+mod stream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
