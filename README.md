@@ -61,6 +61,7 @@ cargo run
 | `/resume` | Resume playback (YouTube or Spotify) |
 | `/stop` | Stop playback and leave the voice channel |
 | `/spotify play <url>` | Play a Spotify track, album, or playlist |
+| `/spotify probe` | Test VoiceMeeter capture while Spotify is playing |
 | `/spotify pause` | Pause Spotify playback |
 | `/spotify resume` | Resume Spotify playback |
 | `/spotify skip` | Skip to the next Spotify track |
@@ -69,9 +70,11 @@ cargo run
 
 ## Spotify (local, no API)
 
-Control **Spotify desktop on the host PC** without any Spotify/Apple APIs. Audio reaches Discord via **VoiceMeeter → ffmpeg → Songbird**.
+Control **Spotify desktop on the host PC** without any Spotify API keys. Audio reaches Discord via **VoiceMeeter → ffmpeg → Songbird**.
 
-### Inputs vs outputs (the confusing part)
+**Full setup guide for new machines:** **[docs/spotify-voicemeeter-setup.md](docs/spotify-voicemeeter-setup.md)** (routing, `.env`, probe, troubleshooting).
+
+### Quick reference
 
 Windows shows **two different device lists**:
 
@@ -155,7 +158,7 @@ STREAM_VOLUME=0.35
 - **serenity** `EventHandler` (no poise) — same pattern as DiscordTranslator
 - **songbird** from `crates/songbird` — vendored fork with voice gateway fixes
 - **yt-dlp** → **ffmpeg** → Songbird for YouTube playback (Ogg/Opus pipe)
-- **VoiceMeeter (Input → Out B2) → ffmpeg** for Spotify playback (Ogg/Opus pipe)
+- **VoiceMeeter (Input → Out B2) → ffmpeg (f32le PCM)** for Spotify playback (Songbird `RawAdapter`)
 - **Windows SMTC** for Spotify transport control (no API keys needed)
 
 ## Voice / DAVE troubleshooting
