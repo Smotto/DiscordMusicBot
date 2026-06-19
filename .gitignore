@@ -1,0 +1,25 @@
+# Environment — contains bot tokens and secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+/target/
+crates/*/target/
+
+# Nested lockfiles from vendored crates (root Cargo.lock is canonical)
+crates/*/Cargo.lock
+
+# Rust analyzer / IDE
+.rust-analyzer/
+.idea/
+.vscode/*
+!.vscode/settings.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
