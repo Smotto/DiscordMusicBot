@@ -478,7 +478,8 @@ impl AuxNetwork {
                             ),
                         }
                     }
-                    self.try_enable_dave_media().await;
+                    // Wait for DaveExecuteTransition before sending RTP on the new epoch.
+                    self.dave_media_allowed.store(false, Ordering::Release);
                 } else {
                     info!("DAVE: process_proposals returned None (no commit/welcome to send)");
                 }
@@ -498,10 +499,26 @@ impl AuxNetwork {
                     .is_some_and(|s| s.is_ready());
 
                 if already_ready {
-                    tracing::debug!(
-                        "DAVE: Ignoring AnnounceCommitTransition (transition_id={}) — already merged locally",
-                        ev.transition_id
-                    );
+                    if ev.transition_id != 0 {
+                        info!(
+                            "DAVE: AnnounceCommitTransition (transition_id={}) after local merge — registering for execute",
+                            ev.transition_id
+                        );
+                        let protocol_version =
+                            self.dave_protocol_version.load(Ordering::Relaxed);
+                        self.dave_pending_transitions
+                            .insert(ev.transition_id, protocol_version);
+                        self.ws_client
+                            .send_json(&GatewayEvent::from(DaveTransitionReady {
+                                transition_id: ev.transition_id,
+                                protocol_version,
+                            }))
+                            .await?;
+                    } else {
+                        tracing::debug!(
+                            "DAVE: AnnounceCommitTransition (transition_id=0) after local merge — already ready"
+                        );
+                    }
                 } else {
                     info!(
                         "DAVE: Received DaveMlsAnnounceCommitTransition (transition_id={})",
@@ -688,6 +705,23 @@ impl AuxNetwork {
         info!("DAVE: Media enabled (session is_ready=true)");
     }
 
+    async fn reassert_speaking_after_dave(&mut self) {
+        if self.speaking.contains(SpeakingState::MICROPHONE) && !self.dont_send {
+            if let Err(e) = self
+                .ws_client
+                .send_json(&GatewayEvent::from(Speaking {
+                    delay: Some(0),
+                    speaking: self.speaking,
+                    ssrc: self.ssrc,
+                    user_id: None,
+                }))
+                .await
+            {
+                warn!("WS: Failed to re-assert speaking after DAVE transition: {:?}", e);
+            }
+        }
+    }
+
     async fn execute_dave_transition(&mut self, transition_id: u16) {
         let Some(new_version) = self.dave_pending_transitions.get(&transition_id).copied() else {
             warn!("Received DaveExecuteTransition for unknown transition ID {transition_id}");
@@ -697,11 +731,14 @@ impl AuxNetwork {
                 .unwrap()
                 .as_ref()
                 .is_some_and(|s| s.is_ready());
-            if is_ready && !self.dave_media_allowed.load(Ordering::Acquire) {
-                self.dave_media_allowed.store(true, Ordering::Release);
-                info!(
-                    "DAVE: RTP media allowed (fallback, unknown transition_id={transition_id})"
-                );
+            if is_ready {
+                if !self.dave_media_allowed.load(Ordering::Acquire) {
+                    self.dave_media_allowed.store(true, Ordering::Release);
+                    info!(
+                        "DAVE: RTP media allowed (fallback, unknown transition_id={transition_id})"
+                    );
+                }
+                self.reassert_speaking_after_dave().await;
             }
             return;
         };
@@ -723,20 +760,7 @@ impl AuxNetwork {
 
         // Re-assert speaking now that DAVE allows media — the earlier speaking
         // packet was deferred because dave_media_allowed was false.
-        if self.speaking.contains(SpeakingState::MICROPHONE) && !self.dont_send {
-            if let Err(e) = self
-                .ws_client
-                .send_json(&GatewayEvent::from(Speaking {
-                    delay: Some(0),
-                    speaking: self.speaking,
-                    ssrc: self.ssrc,
-                    user_id: None,
-                }))
-                .await
-            {
-                warn!("WS: Failed to re-assert speaking after DAVE transition: {:?}", e);
-            }
-        }
+        self.reassert_speaking_after_dave().await;
     }
 }
 
