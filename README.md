@@ -60,7 +60,8 @@ cargo run
 | `/pause` | Pause playback (YouTube or Spotify) |
 | `/resume` | Resume playback (YouTube or Spotify) |
 | `/stop` | Stop playback and leave the voice channel |
-| `/spotify play <url>` | Play a Spotify track, album, or playlist |
+| `/spotify play <url>` | Play a Spotify track, album, or playlist (queues if already playing) |
+| `/spotify queue` | Show now playing and queued Spotify tracks |
 | `/spotify probe` | Test VoiceMeeter capture while Spotify is playing |
 | `/spotify pause` | Pause Spotify playback |
 | `/spotify resume` | Resume Spotify playback |

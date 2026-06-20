@@ -164,6 +164,30 @@ mod impl_smtc {
 
         Ok(Some(NowPlaying { title, artist, album }))
     }
+
+    fn timespan_to_duration(ts: windows::Foundation::TimeSpan) -> std::time::Duration {
+        std::time::Duration::from_nanos(ts.Duration.max(0) as u64 * 100)
+    }
+
+    pub(super) fn do_playback_timeline(
+    ) -> Result<Option<(std::time::Duration, std::time::Duration)>, String> {
+        let session = find_spotify_session()?;
+        let timeline = session
+            .GetTimelineProperties()
+            .map_err(|e| format!("SMTC timeline failed: {e}"))?;
+        let position = timeline
+            .Position()
+            .map_err(|e| format!("SMTC position failed: {e}"))?;
+        let end = timeline
+            .EndTime()
+            .map_err(|e| format!("SMTC end time failed: {e}"))?;
+        let pos = timespan_to_duration(position);
+        let end_d = timespan_to_duration(end);
+        if end_d.is_zero() || end_d <= pos {
+            return Ok(None);
+        }
+        Ok(Some((pos, end_d)))
+    }
 }
 
 #[cfg(not(windows))]
@@ -196,6 +220,10 @@ mod impl_smtc {
         Stopped,
     }
     pub(super) fn do_now_playing() -> Result<Option<NowPlaying>, String> {
+        Err("Spotify transport control requires Windows.".into())
+    }
+    pub(super) fn do_playback_timeline(
+    ) -> Result<Option<(std::time::Duration, std::time::Duration)>, String> {
         Err("Spotify transport control requires Windows.".into())
     }
 }
@@ -251,9 +279,27 @@ fn map_playback_status(s: impl_smtc::PlaybackStatus) -> PlaybackStatus {
     }
 }
 
+/// Current playback position within the active Spotify track.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaybackTimeline {
+    pub position: std::time::Duration,
+    pub end: std::time::Duration,
+}
+
+impl PlaybackTimeline {
+    pub fn remaining(&self) -> std::time::Duration {
+        self.end.saturating_sub(self.position)
+    }
+}
+
 /// Returns whether SMTC metadata looks like a different track than before.
 pub fn metadata_differs(before: &NowPlaying, now: &NowPlaying) -> bool {
     before.title != now.title || before.artist != now.artist
+}
+
+pub fn playback_timeline() -> Result<Option<PlaybackTimeline>, String> {
+    impl_smtc::do_playback_timeline()
+        .map(|opt| opt.map(|(position, end)| PlaybackTimeline { position, end }))
 }
 
 /// Get the current Spotify playback status and metadata.

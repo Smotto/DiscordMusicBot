@@ -196,8 +196,6 @@ pub async fn start_guild_stream(
         handler = handler_lock.lock().await;
     }
 
-    handler.queue().stop();
-    handler.stop();
     let track_handle = handler.enqueue(track).await;
     tracing::info!("Spotify capture enqueued for guild {guild_id}");
 
