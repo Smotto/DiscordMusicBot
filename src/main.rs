@@ -4,6 +4,7 @@ mod music;
 mod playback;
 mod smtc;
 mod spotify;
+mod spotify_status;
 mod stream;
 
 #[tokio::main]

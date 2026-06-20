@@ -343,23 +343,124 @@ pub fn format_now_playing(np: &crate::smtc::NowPlaying) -> String {
         .unwrap_or_else(|| "Unknown track".into())
 }
 
-/// Build the `/spotify queue` response body.
-pub fn format_queue_message(now_playing: Option<&str>, queue: &[QueuedSpotify]) -> String {
-    let mut out = String::new();
-    if let Some(np) = now_playing {
-        out.push_str("**Now playing**\n");
-        out.push_str(np);
-        out.push_str("\n\n");
-    }
-    out.push_str("**Queue**\n");
+const SPOTIFY_GREEN: u32 = 0x1DB954;
+const MAX_QUEUE_LINES: usize = 10;
+
+/// Compact numbered queue for embeds.
+pub fn format_queue_list(queue: &[QueuedSpotify], max: usize) -> String {
     if queue.is_empty() {
-        out.push_str("_Empty_");
-    } else {
-        for (i, item) in queue.iter().enumerate() {
-            out.push_str(&format!("{}. {}\n", i + 1, item.display()));
-        }
+        return "_Empty — use `/spotify play` to add tracks_".to_string();
     }
-    out.trim_end().to_string()
+    let mut lines: Vec<String> = queue
+        .iter()
+        .take(max)
+        .enumerate()
+        .map(|(i, item)| format!("`{}.` {}", i + 1, item.display()))
+        .collect();
+    if queue.len() > max {
+        lines.push(format!("_+{} more_", queue.len() - max));
+    }
+    lines.join("\n")
+}
+
+/// Shared now-playing + queue embed for the live status board.
+pub fn build_status_embed(
+    now_playing: Option<&str>,
+    queue: &[QueuedSpotify],
+    footer: Option<&str>,
+) -> serenity::builder::CreateEmbed {
+    use serenity::builder::CreateEmbedFooter;
+
+    let mut embed = serenity::builder::CreateEmbed::new()
+        .title("🎵 Spotify")
+        .color(SPOTIFY_GREEN)
+        .field(
+            "Now playing",
+            now_playing.unwrap_or("_Nothing playing — use `/spotify play`_"),
+            false,
+        )
+        .field("Up next", format_queue_list(queue, MAX_QUEUE_LINES), false);
+
+    if let Some(text) = footer {
+        embed = embed.footer(CreateEmbedFooter::new(text));
+    }
+
+    embed
+}
+
+/// How close to the track end counts as "finished" (Spotify often reports Paused, not Stopped).
+const TRACK_END_TOLERANCE: Duration = Duration::from_secs(3);
+
+async fn playback_at_track_end() -> bool {
+    let Ok(Some(timeline)) = crate::smtc::run_smtc(crate::smtc::playback_timeline).await else {
+        return false;
+    };
+    !timeline.end.is_zero() && timeline.remaining() <= TRACK_END_TOLERANCE
+}
+
+/// True when nothing is meaningfully playing — stopped, or paused/playing at the last few seconds.
+pub async fn is_playback_idle() -> bool {
+    let Ok((status, _)) = crate::smtc::run_smtc(crate::smtc::playback_snapshot).await else {
+        return true;
+    };
+    match status {
+        crate::smtc::PlaybackStatus::Stopped => true,
+        crate::smtc::PlaybackStatus::Playing | crate::smtc::PlaybackStatus::Paused => {
+            playback_at_track_end().await
+        }
+        _ => false,
+    }
+}
+
+/// True when Spotify SMTC reports playing or paused mid-track (not finished).
+pub async fn is_playback_active() -> bool {
+    if is_playback_idle().await {
+        return false;
+    }
+    matches!(
+        crate::smtc::run_smtc(crate::smtc::playback_snapshot).await,
+        Ok((crate::smtc::PlaybackStatus::Playing | crate::smtc::PlaybackStatus::Paused, _))
+    )
+}
+
+/// Label for the status board — hides stale metadata when playback has stopped or finished.
+pub async fn status_board_now_playing() -> Option<String> {
+    if is_playback_idle().await {
+        return None;
+    }
+    let (_, np) = crate::smtc::run_smtc(crate::smtc::playback_snapshot)
+        .await
+        .ok()?;
+    np.map(|meta| format_now_playing(&meta))
+}
+
+/// Update the pinned status message after queue or playback changes.
+pub async fn refresh_status_board_message(
+    board: &crate::spotify_status::SpotifyStatusBoard,
+    http: &serenity::http::Http,
+    queues: &SpotifyQueues,
+    footer: Option<&str>,
+) {
+    let Some(channel_id) = board.channel_id().await else {
+        return;
+    };
+    let now_playing = status_board_now_playing().await;
+    let queue = queues.list().await;
+    let embed = build_status_embed(now_playing.as_deref(), &queue, footer);
+    board.refresh(http, channel_id, embed).await;
+}
+
+/// Start a new track while the Discord voice capture is already running.
+pub async fn play_on_existing_stream(
+    spotify_uri: &SpotifyUri,
+    guard: &SpotifyPlaybackGuard,
+    session: &SpotifySessionTracker,
+) -> Result<SpotifyTrackInfo, String> {
+    let np = start_local_playback(spotify_uri).await?;
+    guard.note().await;
+    let track = track_info_from_smtc(&np, spotify_uri);
+    session.set_intentional(track.clone()).await;
+    Ok(track)
 }
 
 /// Pause current playback, open the requested track in the desktop app, then wait until SMTC reports playing.
@@ -604,6 +705,8 @@ pub fn spawn_queue_watcher(
     guard: Arc<SpotifyPlaybackGuard>,
     session: Arc<SpotifySessionTracker>,
     stream_sessions: Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
+    status_board: Arc<crate::spotify_status::SpotifyStatusBoard>,
+    http: Arc<serenity::http::Http>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -619,6 +722,22 @@ pub fn spawn_queue_watcher(
             }
 
             if guard.recently_programmatic().await {
+                continue;
+            }
+
+            if queues.is_empty().await {
+                if is_playback_idle().await {
+                    session.clear().await;
+                    refresh_status_board_message(&status_board, &http, &queues, None).await;
+                }
+                continue;
+            }
+
+            // Track ended (Stopped or Paused at end) with items waiting — start the queue.
+            if is_playback_idle().await {
+                if try_advance_queue(&queues, &guard, &session, "idle").await {
+                    refresh_status_board_message(&status_board, &http, &queues, None).await;
+                }
                 continue;
             }
 
@@ -638,10 +757,6 @@ pub fn spawn_queue_watcher(
                 }
             }
 
-            if queues.is_empty().await {
-                continue;
-            }
-
             // Preempt before track end so Spotify autoplay does not start.
             if let Ok((crate::smtc::PlaybackStatus::Playing, _)) =
                 crate::smtc::run_smtc(crate::smtc::playback_snapshot).await
@@ -652,7 +767,9 @@ pub fn spawn_queue_watcher(
                     if timeline.position >= MIN_PLAYED_BEFORE_PREEMPT
                         && timeline.remaining() <= QUEUE_PREEMPT_BEFORE_END
                     {
-                        try_advance_queue(&queues, &guard, &session, "preempt").await;
+                        if try_advance_queue(&queues, &guard, &session, "preempt").await {
+                            refresh_status_board_message(&status_board, &http, &queues, None).await;
+                        }
                         continue;
                     }
                 }
@@ -661,10 +778,14 @@ pub fn spawn_queue_watcher(
             // Spotify moved to a different *title* — take back control from the queue.
             match (&now, &intentional) {
                 (Some(np), Some(intent)) if !smtc_title_matches_intentional(np, intent) => {
-                    try_advance_queue(&queues, &guard, &session, "autoplay-override").await;
+                    if try_advance_queue(&queues, &guard, &session, "autoplay-override").await {
+                        refresh_status_board_message(&status_board, &http, &queues, None).await;
+                    }
                 }
                 (Some(_), None) => {
-                    try_advance_queue(&queues, &guard, &session, "no-intentional").await;
+                    if try_advance_queue(&queues, &guard, &session, "no-intentional").await {
+                        refresh_status_board_message(&status_board, &http, &queues, None).await;
+                    }
                 }
                 _ => {}
             }

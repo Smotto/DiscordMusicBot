@@ -3,11 +3,11 @@ use crate::playback::GuildPlayback;
 use crate::spotify;
 use crate::stream;
 use serenity::all::{
-    CommandInteraction, CommandOptionType, Context, Interaction, UserId,
+    ChannelId, CommandInteraction, CommandOptionType, Context, Interaction, UserId,
 };
 use serenity::builder::{
     Builder, CreateCommand, CreateCommandOption, CreateInteractionResponse,
-    CreateInteractionResponseMessage,
+    CreateInteractionResponseMessage, EditInteractionResponse,
 };
 use serenity::prelude::*;
 use songbird::{Config as SongbirdConfig, SerenityInit, Songbird};
@@ -28,6 +28,7 @@ pub struct Handler {
     pub spotify_playback_guard: Arc<spotify::SpotifyPlaybackGuard>,
     pub spotify_session: Arc<crate::playback::SpotifySessionTracker>,
     pub spotify_queue_watcher: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    pub spotify_status_board: Arc<crate::spotify_status::SpotifyStatusBoard>,
     /// In-flight `/spotify play` tasks — aborted by `/stop`.
     pub spotify_play_tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>,
 }
@@ -64,6 +65,7 @@ pub async fn run_bot() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         spotify_playback_guard,
         spotify_session,
         spotify_queue_watcher: Arc::new(Mutex::new(None)),
+        spotify_status_board: crate::spotify_status::SpotifyStatusBoard::new(),
         spotify_play_tasks: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -241,6 +243,48 @@ impl Handler {
         }
     }
 
+    async fn should_queue_spotify_play(&self) -> bool {
+        if !self.spotify_play_tasks.lock().await.is_empty() {
+            return true;
+        }
+        if !self.spotify_stream_active().await {
+            return false;
+        }
+        if !self.spotify_queues.is_empty().await {
+            return true;
+        }
+        spotify::is_playback_active().await
+    }
+
+    async fn spotify_status_snapshot(
+        &self,
+    ) -> (Option<String>, Vec<crate::playback::QueuedSpotify>) {
+        let now_playing = if self.spotify_stream_active().await {
+            spotify::status_board_now_playing().await
+        } else {
+            None
+        };
+        let queue = self.spotify_queues.list().await;
+        (now_playing, queue)
+    }
+
+    async fn refresh_spotify_status_board(
+        &self,
+        http: &serenity::http::Http,
+        channel_id: ChannelId,
+        footer: Option<&str>,
+    ) {
+        let (now_playing, queue) = self.spotify_status_snapshot().await;
+        let embed = spotify::build_status_embed(now_playing.as_deref(), &queue, footer);
+        self.spotify_status_board
+            .refresh(http, channel_id, embed)
+            .await;
+    }
+
+    fn spotify_ephemeral() -> CreateInteractionResponseMessage {
+        CreateInteractionResponseMessage::new().ephemeral(true)
+    }
+
     async fn cancel_spotify_play(&self, guild_id: serenity::all::GuildId) {
         if let Some(handle) = self.spotify_play_tasks.lock().await.remove(&guild_id.get()) {
             handle.abort();
@@ -412,30 +456,50 @@ impl Handler {
     ) {
         let mode = self.playback_modes.get(guild_id).await;
         let spotify_active = self.spotify_stream_active().await;
-        let result: Result<(), String> = if spotify_active {
-            spotify::skip_or_play_next(
+        if spotify_active {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Defer(Self::spotify_ephemeral()),
+                )
+                .await;
+            let result = spotify::skip_or_play_next(
                 &self.spotify_queues,
                 &self.spotify_playback_guard,
                 &self.spotify_session,
             )
-            .await
-        } else {
-            match mode {
-                GuildPlayback::Youtube => music::skip(&self.songbird, guild_id).await,
-                GuildPlayback::Idle => Err("Nothing is playing.".into()),
-                GuildPlayback::Spotify => Err("Nothing is playing.".into()),
+            .await;
+            match result {
+                Ok(()) => {
+                    self.refresh_spotify_status_board(&ctx.http, cmd.channel_id, None)
+                        .await;
+                    let _ = cmd
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new().content("⏭ Skipped."),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    let _ = cmd
+                        .edit_response(&ctx.http, EditInteractionResponse::new().content(e))
+                        .await;
+                }
             }
+            return;
+        }
+
+        let result: Result<(), String> = match mode {
+            GuildPlayback::Youtube => music::skip(&self.songbird, guild_id).await,
+            GuildPlayback::Idle => Err("Nothing is playing.".into()),
+            GuildPlayback::Spotify => Err("Nothing is playing.".into()),
         };
         self.handle_result(
             ctx,
             cmd,
-            if spotify_active {
-                "⏭ Skipped Spotify track."
-            } else {
-                match mode {
-                    GuildPlayback::Youtube => "⏭ Skipped.",
-                    _ => "⏭ Skipped.",
-                }
+            match mode {
+                GuildPlayback::Youtube => "⏭ Skipped.",
+                _ => "⏭ Skipped.",
             },
             result,
         )
@@ -542,6 +606,9 @@ impl Handler {
             self.spotify_queues.clear().await;
             self.spotify_session.clear().await;
             self.stop_spotify_queue_watcher().await;
+            self.spotify_status_board
+                .delete_message(&ctx.http)
+                .await;
         }
 
         let content = match result {
@@ -588,14 +655,38 @@ impl Handler {
                 self.handle_result(ctx, cmd, "▶ Resumed Spotify.", result).await;
             }
             "skip" => {
+                let _ = cmd
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Defer(Self::spotify_ephemeral()),
+                    )
+                    .await;
                 let result = spotify::skip_or_play_next(
                     &self.spotify_queues,
                     &self.spotify_playback_guard,
                     &self.spotify_session,
                 )
                 .await;
-                self.handle_result(ctx, cmd, "⏭ Skipped Spotify track.", result)
-                    .await;
+                match result {
+                    Ok(()) => {
+                        self.refresh_spotify_status_board(&ctx.http, cmd.channel_id, None)
+                            .await;
+                        let _ = cmd
+                            .edit_response(
+                                &ctx.http,
+                                EditInteractionResponse::new().content("⏭ Skipped."),
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = cmd
+                            .edit_response(
+                                &ctx.http,
+                                EditInteractionResponse::new().content(e),
+                            )
+                            .await;
+                    }
+                }
             }
             "previous" => {
                 let result = crate::smtc::run_smtc(crate::smtc::skip_previous).await;
@@ -653,10 +744,19 @@ impl Handler {
         };
 
         // Discord requires a response within 3s — defer before any HTTP/voice/capture work.
+        let stream_up = self.spotify_stream_active().await
+            || !self.spotify_play_tasks.lock().await.is_empty();
+        let should_queue = self.should_queue_spotify_play().await;
+
+        let defer_msg = if stream_up {
+            Self::spotify_ephemeral()
+        } else {
+            CreateInteractionResponseMessage::new()
+        };
         if let Err(e) = cmd
             .create_response(
                 &ctx.http,
-                CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
+                CreateInteractionResponse::Defer(defer_msg),
             )
             .await
         {
@@ -664,44 +764,81 @@ impl Handler {
             return;
         }
 
-        // One Spotify desktop app → queue whenever any voice stream is up or starting.
-        let spotify_active = self.spotify_stream_active().await
-            || !self.spotify_play_tasks.lock().await.is_empty();
-        if spotify_active {
-            let meta = spotify::fetch_link_metadata(&self.http_client, &spotify_uri, &url).await;
-            if let Some(current) = self.spotify_session.get_intentional().await {
-                if current.same_uri(&meta.uri) {
+        // Voice stream up but Spotify stopped — play immediately, don't queue.
+        if stream_up && !should_queue {
+            match spotify::play_on_existing_stream(
+                &spotify_uri,
+                &self.spotify_playback_guard,
+                &self.spotify_session,
+            )
+            .await
+            {
+                Ok(track) => {
+                    self.refresh_spotify_status_board(&ctx.http, cmd.channel_id, None)
+                        .await;
                     let _ = cmd
                         .edit_response(
                             &ctx.http,
-                            serenity::builder::EditInteractionResponse::new().content(format!(
-                                "Already playing **{}**.",
-                                current.display()
+                            EditInteractionResponse::new().content(format!(
+                                "▶ Now playing **{}**",
+                                track.display()
                             )),
                         )
                         .await;
-                    return;
+                }
+                Err(e) => {
+                    let _ = cmd
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new().content(format!(
+                                "Failed to start Spotify playback:\n{e}"
+                            )),
+                        )
+                        .await;
                 }
             }
-            if let Ok(Some(np)) = crate::smtc::run_smtc(crate::smtc::now_playing).await {
-                if spotify::metadata_matches_track(&np, &meta) {
-                    let _ = cmd
-                        .edit_response(
-                            &ctx.http,
-                            serenity::builder::EditInteractionResponse::new().content(format!(
-                                "Already playing **{}**.",
-                                meta.display()
-                            )),
-                        )
-                        .await;
-                    return;
+            return;
+        }
+
+        // Queue while something is actively playing/paused or already lined up.
+        if should_queue {
+            let meta = spotify::fetch_link_metadata(&self.http_client, &spotify_uri, &url).await;
+            let playback_active = spotify::is_playback_active().await;
+            if playback_active {
+                if let Some(current) = self.spotify_session.get_intentional().await {
+                    if current.same_uri(&meta.uri) {
+                        let _ = cmd
+                            .edit_response(
+                                &ctx.http,
+                                EditInteractionResponse::new().content(format!(
+                                    "Already playing **{}**.",
+                                    current.display()
+                                )),
+                            )
+                            .await;
+                        return;
+                    }
+                }
+                if let Ok(Some(np)) = crate::smtc::run_smtc(crate::smtc::now_playing).await {
+                    if spotify::metadata_matches_track(&np, &meta) {
+                        let _ = cmd
+                            .edit_response(
+                                &ctx.http,
+                                EditInteractionResponse::new().content(format!(
+                                    "Already playing **{}**.",
+                                    meta.display()
+                                )),
+                            )
+                            .await;
+                        return;
+                    }
                 }
             }
             if self.spotify_queues.contains_uri(&meta.uri).await {
                 let _ = cmd
                     .edit_response(
                         &ctx.http,
-                        serenity::builder::EditInteractionResponse::new().content(format!(
+                        EditInteractionResponse::new().content(format!(
                             "Already in queue: **{}**.",
                             meta.display()
                         )),
@@ -710,12 +847,13 @@ impl Handler {
                 return;
             }
             let position = self.spotify_queues.push(meta.clone()).await;
+            self.refresh_spotify_status_board(&ctx.http, cmd.channel_id, None)
+                .await;
             let _ = cmd
                 .edit_response(
                     &ctx.http,
-                    serenity::builder::EditInteractionResponse::new().content(format!(
-                        "🎵 Queued `#{position}`: **{}**\n\
-                         Use `/skip` for the next track, or `/spotify queue` to see the list.",
+                    EditInteractionResponse::new().content(format!(
+                        "✅ Queued **`#{position}`** · **{}**",
                         meta.display()
                     )),
                 )
@@ -723,7 +861,6 @@ impl Handler {
             return;
         }
 
-        let device = crate::stream::capture_device();
         let stream_sessions = self.stream_sessions.clone();
         let songbird = self.songbird.clone();
         let registered = self.track_events_registered.clone();
@@ -733,7 +870,10 @@ impl Handler {
         let spotify_playback_guard = self.spotify_playback_guard.clone();
         let spotify_session = self.spotify_session.clone();
         let spotify_queue_watcher = self.spotify_queue_watcher.clone();
+        let spotify_status_board = self.spotify_status_board.clone();
         let http = ctx.http.clone();
+        let play_channel_id = cmd.channel_id;
+        let http_for_watcher = http.clone();
         let ctx = ctx.clone();
         let cmd = cmd.clone();
         let spotify_play_tasks = self.spotify_play_tasks.clone();
@@ -779,7 +919,7 @@ impl Handler {
                 }
             }
 
-            edit("🎵 Joining voice channel…".to_string()).await;
+            edit("🎵 Starting…".to_string()).await;
 
             if let Err(e) = music::ensure_in_voice(
                 &songbird,
@@ -803,8 +943,6 @@ impl Handler {
                 return;
             }
 
-            edit("🎵 Pausing Spotify and opening your link…".to_string()).await;
-
             let now_playing = match spotify::start_local_playback(&spotify_uri).await {
                 Ok(np) => np,
                 Err(e) => {
@@ -817,11 +955,6 @@ impl Handler {
             let track = spotify::track_info_from_smtc(&now_playing, &spotify_uri);
             spotify_playback_guard.note().await;
             spotify_session.set_intentional(track.clone()).await;
-            edit(format!(
-                "🎵 Spotify is playing — waiting for audio on:\n\
-                 `{device}`"
-            ))
-            .await;
 
             match tokio::time::timeout(
                 Duration::from_secs(90),
@@ -842,24 +975,35 @@ impl Handler {
                                 spotify_playback_guard.clone(),
                                 spotify_session.clone(),
                                 stream_sessions.clone(),
+                                spotify_status_board.clone(),
+                                http_for_watcher.clone(),
                             );
                             *slot = Some(watcher.abort_handle());
                         }
                     }
                     tracing::info!("Spotify cable stream active for guild {guild_id}");
-                    let queued = spotify_queues.len().await;
-                    let queue_note = if queued > 0 {
-                        format!("\n`{queued}` track(s) queued — `/skip` for next.")
-                    } else {
-                        String::new()
-                    };
-                    edit(format!(
-                        "🎵 Playing Spotify.\n\
-                         `{}`\n\
-                         Streaming via `{device}`.{queue_note}",
-                        track.display(),
-                    ))
-                    .await;
+                    let queue = spotify_queues.list().await;
+                    let embed = spotify::build_status_embed(
+                        Some(&track.display()),
+                        &queue,
+                        None,
+                    );
+                    match cmd
+                        .edit_response(
+                            &http,
+                            EditInteractionResponse::new()
+                                .content("")
+                                .embed(embed),
+                        )
+                        .await
+                    {
+                        Ok(msg) => {
+                            spotify_status_board.set(play_channel_id, msg.id).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to post Spotify status embed: {e}");
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Failed to start Spotify cable stream: {e}");
@@ -876,8 +1020,7 @@ impl Handler {
                     tracing::error!("Spotify stream timed out for guild {guild_id}");
                     edit(format!(
                         "Timed out starting Discord stream for `{}`.\n\
-                         Audio on `{device}` or voice join took too long.\n\
-                         Try `/spotify probe` while Spotify plays (not during `/spotify play`).",
+                         Try again in a few seconds.",
                         track.display(),
                     ))
                     .await;
@@ -961,28 +1104,18 @@ impl Handler {
         let _ = cmd
             .create_response(
                 &ctx.http,
-                CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
+                CreateInteractionResponse::Defer(Self::spotify_ephemeral()),
             )
             .await;
 
-        let now_playing = if self.spotify_stream_active().await {
-            crate::smtc::run_smtc(crate::smtc::now_playing)
-                .await
-                .ok()
-                .flatten()
-                .map(|np| spotify::format_now_playing(&np))
-        } else {
-            None
-        };
+        self.refresh_spotify_status_board(&ctx.http, cmd.channel_id, None)
+            .await;
 
-        let queue = self.spotify_queues.list().await;
-        let body = spotify::format_queue_message(now_playing.as_deref(), &queue);
+        let (now_playing, queue) = self.spotify_status_snapshot().await;
+        let embed = spotify::build_status_embed(now_playing.as_deref(), &queue, None);
 
         let _ = cmd
-            .edit_response(
-                &ctx.http,
-                serenity::builder::EditInteractionResponse::new().content(body),
-            )
+            .edit_response(&ctx.http, EditInteractionResponse::new().embed(embed))
             .await;
     }
 
