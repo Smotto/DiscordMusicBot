@@ -29,13 +29,18 @@ pub const PLAYBACK_VOLUME: f32 = 0.99;
 pub struct VoiceIdleManager {
     timers: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
     playback_modes: Arc<PlaybackModes>,
+    stream_sessions: Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
 }
 
 impl VoiceIdleManager {
-    pub fn new(playback_modes: Arc<PlaybackModes>) -> Arc<Self> {
+    pub fn new(
+        playback_modes: Arc<PlaybackModes>,
+        stream_sessions: Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             timers: Mutex::new(HashMap::new()),
             playback_modes,
+            stream_sessions,
         })
     }
 
@@ -49,6 +54,10 @@ impl VoiceIdleManager {
         self.playback_modes.clone()
     }
 
+    pub fn stream_sessions(&self) -> Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>> {
+        self.stream_sessions.clone()
+    }
+
     pub async fn schedule(
         self: &Arc<Self>,
         songbird: Arc<Songbird>,
@@ -59,16 +68,17 @@ impl VoiceIdleManager {
 
         let idle = Arc::clone(self);
         let playback_modes = self.playback_modes.clone();
+        let stream_sessions = self.stream_sessions.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(VOICE_IDLE_TIMEOUT).await;
-            if !is_voice_idle(&songbird, guild_id, &playback_modes).await {
+            if !is_voice_idle(&songbird, guild_id, &playback_modes, &stream_sessions).await {
                 return;
             }
             tracing::info!(
                 "No playback for {} minutes in guild {guild_id} — leaving voice channel",
                 VOICE_IDLE_TIMEOUT.as_secs() / 60
             );
-            idle_disconnect(&songbird, guild_id, &registered).await;
+            idle_disconnect(&songbird, guild_id, &registered, &stream_sessions).await;
             idle.cancel(guild_id).await;
         });
 
@@ -83,8 +93,12 @@ async fn is_voice_idle(
     songbird: &Arc<Songbird>,
     guild_id: GuildId,
     playback_modes: &PlaybackModes,
+    stream_sessions: &Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
 ) -> bool {
     if playback_modes.get(guild_id).await == GuildPlayback::Spotify {
+        return false;
+    }
+    if stream_sessions.lock().await.contains_key(&guild_id.get()) {
         return false;
     }
 
@@ -99,7 +113,11 @@ async fn idle_disconnect(
     songbird: &Arc<Songbird>,
     guild_id: GuildId,
     registered: &Arc<Mutex<HashSet<u64>>>,
+    stream_sessions: &Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
 ) {
+    if stream_sessions.lock().await.contains_key(&guild_id.get()) {
+        return;
+    }
     let Some(handler_lock) = songbird.get(guild_id) else {
         return;
     };
@@ -121,6 +139,7 @@ struct IdleDisconnectOnEnd {
     idle: Arc<VoiceIdleManager>,
     registered: Arc<Mutex<HashSet<u64>>>,
     playback_modes: Arc<PlaybackModes>,
+    stream_sessions: Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
 }
 
 #[async_trait::async_trait]
@@ -131,10 +150,18 @@ impl SongbirdEventHandler for IdleDisconnectOnEnd {
         let idle = self.idle.clone();
         let registered = self.registered.clone();
         let playback_modes = self.playback_modes.clone();
+        let stream_sessions = self.stream_sessions.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if is_voice_idle(&songbird, guild_id, &playback_modes).await {
+            if is_voice_idle(
+                &songbird,
+                guild_id,
+                &playback_modes,
+                &stream_sessions,
+            )
+            .await
+            {
                 idle.schedule(songbird, guild_id, registered).await;
             }
         });
@@ -434,6 +461,8 @@ async fn register_track_events(
     }
     drop(set);
 
+    let stream_sessions = idle.stream_sessions();
+
     handler.add_global_event(
         Event::Track(TrackEvent::Error),
         LogTrackEvents,
@@ -452,6 +481,7 @@ async fn register_track_events(
             idle: idle.clone(),
             registered: registered.clone(),
             playback_modes: idle.playback_modes(),
+            stream_sessions,
         },
     );
     handler.add_global_event(
