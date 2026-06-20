@@ -1,12 +1,11 @@
-use crate::playback::{QueuedSpotify, SpotifyQueues};
-use serenity::all::GuildId;
+use crate::playback::{IntentionalTrack, QueuedSpotify, SpotifyQueues, SpotifySessionTracker, SpotifyTrackInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// Parsed Spotify URI info (track, album, or playlist).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpotifyKind {
     Track,
     Album,
@@ -158,8 +157,25 @@ fn parse_json_string_field(json: &str, key: &str) -> Option<String> {
     Some(out).filter(|s| !s.is_empty())
 }
 
-/// Resolve a human-readable title via Spotify's public oEmbed endpoint (no API key).
-pub async fn fetch_link_title(
+/// Resolve title (and artist for tracks) for queue labels and matching.
+pub async fn fetch_link_metadata(
+    client: &reqwest::Client,
+    spotify: &SpotifyUri,
+    input: &str,
+) -> SpotifyTrackInfo {
+    let title = fetch_oembed_title(client, spotify, input).await;
+    let artist = match spotify.kind {
+        SpotifyKind::Track => fetch_track_page_artist(client, &spotify.id).await,
+        _ => None,
+    };
+    SpotifyTrackInfo {
+        uri: spotify.clone(),
+        title,
+        artist: artist.map(|a| sanitize_artist(&a)).filter(|a| !a.is_empty()),
+    }
+}
+
+async fn fetch_oembed_title(
     client: &reqwest::Client,
     spotify: &SpotifyUri,
     input: &str,
@@ -188,6 +204,130 @@ pub async fn fetch_link_title(
     to_uri(spotify)
 }
 
+/// Best-effort artist from the public track page (no API key).
+async fn fetch_track_page_artist(client: &reqwest::Client, track_id: &str) -> Option<String> {
+    let url = format!("https://open.spotify.com/track/{track_id}");
+    let body = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; DiscordMusicBot/1.0)")
+        .header("Accept-Language", "en")
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    parse_track_page_artist(&body)
+}
+
+/// Strip Spotify locale junk from artist strings (`en`, `en王翊恩`, etc.).
+pub fn sanitize_artist(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // SMTC sometimes glues a 2-letter locale prefix onto the name: "en王翊恩".
+    if trimmed.len() > 2 {
+        let mut chars = trimmed.chars();
+        let a = chars.next().unwrap();
+        let b = chars.next().unwrap();
+        if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() {
+            let rest: String = chars.collect();
+            if !rest.is_empty() && rest.chars().next().is_some_and(|c| !c.is_ascii_alphabetic()) {
+                return rest.trim().to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn is_og_noise_segment(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    // Locale tags: en, zh-hans, pt-br, …
+    if lower.len() <= 8
+        && lower
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || c == '-')
+    {
+        return true;
+    }
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    lower.contains("song")
+}
+
+fn parse_track_page_artist(html: &str) -> Option<String> {
+    // Prefer embedded JSON — more reliable than og:description segments.
+    if let Some(idx) = html.find(r#""artists":[{"uri":"spotify:artist:"#) {
+        let slice = &html[idx..idx.saturating_add(1200)];
+        if let Some(name) = parse_json_string_field(slice, "name") {
+            let clean = sanitize_artist(&name);
+            if !clean.is_empty() && !is_og_noise_segment(&clean) {
+                return Some(clean);
+            }
+        }
+    }
+
+    // og:description: "Listen to Song on Spotify. en · Artist · Album · …"
+    if let Some(content) = parse_meta_content(html, "og:description") {
+        if let Some(rest) = content.split(" on Spotify.").nth(1) {
+            for segment in rest.split('·') {
+                let artist = sanitize_artist(segment);
+                if !artist.is_empty() && !is_og_noise_segment(&artist) {
+                    return Some(artist);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_meta_content(html: &str, property: &str) -> Option<String> {
+    let needle = format!("property=\"{property}\" content=\"");
+    let start = html.find(&needle)? + needle.len();
+    let mut out = String::new();
+    let mut escape = false;
+    for c in html[start..].chars() {
+        if escape {
+            out.push(c);
+            escape = false;
+        } else if c == '\\' {
+            escape = true;
+        } else if c == '"' {
+            break;
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out).filter(|s| !s.is_empty())
+}
+
+/// Build canonical track info from live SMTC metadata after playback starts.
+pub fn track_info_from_smtc(np: &crate::smtc::NowPlaying, uri: &SpotifyUri) -> SpotifyTrackInfo {
+    SpotifyTrackInfo {
+        uri: uri.clone(),
+        title: np
+            .title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| to_uri(uri)),
+        artist: np
+            .artist
+            .as_deref()
+            .map(sanitize_artist)
+            .filter(|a| !a.is_empty()),
+    }
+}
+
 /// Format SMTC metadata for Discord messages.
 pub fn format_now_playing(np: &crate::smtc::NowPlaying) -> String {
     np.title
@@ -195,6 +335,8 @@ pub fn format_now_playing(np: &crate::smtc::NowPlaying) -> String {
         .map(|t| {
             np.artist
                 .as_deref()
+                .map(sanitize_artist)
+                .filter(|a| !a.is_empty())
                 .map(|a| format!("{t} — {a}"))
                 .unwrap_or_else(|| t.to_string())
         })
@@ -214,7 +356,7 @@ pub fn format_queue_message(now_playing: Option<&str>, queue: &[QueuedSpotify]) 
         out.push_str("_Empty_");
     } else {
         for (i, item) in queue.iter().enumerate() {
-            out.push_str(&format!("{}. {}\n", i + 1, item.label));
+            out.push_str(&format!("{}. {}\n", i + 1, item.display()));
         }
     }
     out.trim_end().to_string()
@@ -237,12 +379,49 @@ pub async fn start_local_playback(spotify: &SpotifyUri) -> Result<crate::smtc::N
     open_and_wait(spotify, &before).await
 }
 
-/// Open a queued track without pausing first — faster, avoids a blip of Spotify autoplay.
-async fn advance_local_playback(spotify: &SpotifyUri) -> Result<crate::smtc::NowPlaying, String> {
+/// Open a queued track and confirm SMTC shows that song before returning.
+async fn advance_local_playback_verified(
+    expected: &SpotifyTrackInfo,
+) -> Result<crate::smtc::NowPlaying, String> {
+    use std::time::Duration;
+
     let before = crate::smtc::run_smtc(crate::smtc::now_playing)
         .await?
         .unwrap_or_default();
-    open_and_wait(spotify, &before).await
+
+    // Pause so Spotify autoplay does not win the race when we open the queued URI.
+    crate::smtc::run_smtc(crate::smtc::pause).await.ok();
+    crate::smtc::wait_until_status(crate::smtc::PlaybackStatus::Paused, Duration::from_secs(5))
+        .await
+        .ok();
+
+    let uri = to_uri(&expected.uri);
+    tracing::info!(
+        "Opening queued Spotify URI: {uri} (expect \"{}\")",
+        expected.display()
+    );
+    open_spotify_uri(&uri)?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let (status, np) = crate::smtc::run_smtc(crate::smtc::playback_snapshot).await?;
+        if status == crate::smtc::PlaybackStatus::Playing {
+            if let Some(now) = np {
+                if now.title.is_some()
+                    && metadata_matches_track(&now, expected)
+                    && crate::smtc::metadata_differs(&before, &now)
+                {
+                    return Ok(now);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!(
+        "Spotify did not start \"{}\" within 30s (autoplay may have taken over).",
+        expected.display()
+    ))
 }
 
 async fn open_and_wait(
@@ -261,66 +440,159 @@ async fn open_and_wait(
 
 /// Human-readable label for Discord responses.
 pub fn now_playing_label(np: &crate::smtc::NowPlaying, fallback: &SpotifyUri) -> String {
-    if np.title.is_some() {
-        format_now_playing(np)
-    } else {
-        to_uri(fallback)
+    track_info_from_smtc(np, fallback).display()
+}
+
+fn normalize_field(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fields_equal(a: &str, b: &str) -> bool {
+    normalize_field(a) == normalize_field(b)
+}
+
+/// True when SMTC metadata matches the expected track (strict title; artist when known).
+pub fn metadata_matches_track(np: &crate::smtc::NowPlaying, expected: &SpotifyTrackInfo) -> bool {
+    let Some(actual_title) = np.title.as_deref().filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    if !fields_equal(actual_title, &expected.title) {
+        return false;
+    }
+    match (
+        expected.artist.as_deref().filter(|a| !a.is_empty()),
+        np.artist.as_deref().filter(|a| !a.is_empty()),
+    ) {
+        (Some(exp), Some(act)) => fields_equal(exp, act),
+        _ => true,
     }
 }
 
 /// Debounce SMTC metadata watches after the bot changes tracks programmatically.
 pub struct SpotifyPlaybackGuard {
-    last_programmatic: Mutex<HashMap<u64, Instant>>,
+    last_programmatic: Mutex<Option<Instant>>,
 }
 
 impl SpotifyPlaybackGuard {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            last_programmatic: Mutex::new(HashMap::new()),
+            last_programmatic: Mutex::new(None),
         })
     }
 
-    pub async fn note(&self, guild_id: GuildId) {
-        self.last_programmatic
-            .lock()
-            .await
-            .insert(guild_id.get(), Instant::now());
+    pub async fn note(&self) {
+        *self.last_programmatic.lock().await = Some(Instant::now());
     }
 
-    async fn recently_programmatic(&self, guild_id: GuildId) -> bool {
+    async fn recently_programmatic(&self) -> bool {
         self.last_programmatic
             .lock()
             .await
-            .get(&guild_id.get())
             .is_some_and(|t| t.elapsed() < Duration::from_secs(3))
     }
 }
 
-/// Poll faster when a queue is active; preempt ~1.2s before track end.
-const QUEUE_WATCH_ACTIVE: Duration = Duration::from_millis(300);
+/// Poll faster when a queue is active; preempt before Spotify autoplay wins.
+const QUEUE_WATCH_ACTIVE: Duration = Duration::from_millis(200);
 const QUEUE_WATCH_IDLE: Duration = Duration::from_secs(2);
-const QUEUE_PREEMPT_BEFORE_END: Duration = Duration::from_millis(1200);
-const MIN_PLAYED_BEFORE_PREEMPT: Duration = Duration::from_secs(5);
+const QUEUE_PREEMPT_BEFORE_END: Duration = Duration::from_millis(2500);
+const MIN_PLAYED_BEFORE_PREEMPT: Duration = Duration::from_secs(3);
 
-pub async fn play_queued(
-    guild_id: GuildId,
-    item: &QueuedSpotify,
+/// True when SMTC title matches what the bot thinks is playing (ignore artist drift).
+pub fn smtc_title_matches_intentional(np: &crate::smtc::NowPlaying, intentional: &IntentionalTrack) -> bool {
+    np.title
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .is_some_and(|t| fields_equal(t, &intentional.title))
+}
+
+async fn try_advance_queue(
+    queues: &SpotifyQueues,
     guard: &SpotifyPlaybackGuard,
-) -> Result<crate::smtc::NowPlaying, String> {
-    guard.note(guild_id).await;
-    advance_local_playback(&item.uri).await
+    session: &SpotifySessionTracker,
+    reason: &str,
+) -> bool {
+    let Some(next) = queues.peek_front().await else {
+        return false;
+    };
+
+    let live = crate::smtc::run_smtc(crate::smtc::now_playing)
+        .await
+        .ok()
+        .flatten();
+
+    // Spotify already on this queued track — adopt and pop without reopening.
+    if live
+        .as_ref()
+        .is_some_and(|np| metadata_matches_track(np, &next))
+    {
+        guard.note().await;
+        queues.pop_front().await;
+        if let Some(np) = live {
+            session
+                .set_intentional(track_info_from_smtc(&np, &next.uri))
+                .await;
+        }
+        tracing::info!(
+            "Spotify queue advance ({reason}): already on \"{}\" — adopted",
+            next.display()
+        );
+        return true;
+    }
+
+    // Bot thinks this URI is current — drop duplicate queue entry.
+    if session
+        .get_intentional()
+        .await
+        .is_some_and(|current| current.same_uri(&next.uri))
+    {
+        guard.note().await;
+        queues.pop_front().await;
+        tracing::info!(
+            "Spotify queue advance ({reason}): duplicate \"{}\" — skipped reopen",
+            next.display()
+        );
+        return true;
+    }
+
+    match advance_local_playback_verified(&next).await {
+        Ok(np) => {
+            guard.note().await;
+            queues.pop_front().await;
+            session
+                .set_intentional(track_info_from_smtc(&np, &next.uri))
+                .await;
+            tracing::info!("Spotify queue advance ({reason}): {}", next.display());
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Spotify queue advance failed ({reason}) for \"{}\": {e}",
+                next.display()
+            );
+            false
+        }
+    }
 }
 
 /// Skip via SMTC, or play the next queued URI if the user built a queue.
 pub async fn skip_or_play_next(
-    guild_id: GuildId,
     queues: &SpotifyQueues,
     guard: &SpotifyPlaybackGuard,
+    session: &SpotifySessionTracker,
 ) -> Result<(), String> {
-    if let Some(next) = queues.pop_front(guild_id).await {
-        tracing::info!("Spotify skip: playing queued {}", next.label);
-        play_queued(guild_id, &next, guard).await?;
-        Ok(())
+    if queues.peek_front().await.is_some() {
+        if try_advance_queue(queues, guard, session, "skip").await {
+            Ok(())
+        } else {
+            Err("Failed to start the next queued track.".into())
+        }
     } else {
         crate::smtc::run_smtc(crate::smtc::skip_next).await
     }
@@ -328,42 +600,49 @@ pub async fn skip_or_play_next(
 
 /// When a track ends and the queue has entries, open the next link in Spotify.
 pub fn spawn_queue_watcher(
-    guild_id: GuildId,
     queues: Arc<SpotifyQueues>,
     guard: Arc<SpotifyPlaybackGuard>,
+    session: Arc<SpotifySessionTracker>,
     stream_sessions: Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut baseline = crate::smtc::run_smtc(crate::smtc::now_playing)
-            .await
-            .ok()
-            .flatten();
-
         loop {
-            let interval = if queues.is_empty(guild_id).await {
+            let interval = if queues.is_empty().await {
                 QUEUE_WATCH_IDLE
             } else {
                 QUEUE_WATCH_ACTIVE
             };
             tokio::time::sleep(interval).await;
 
-            if !stream_sessions.lock().await.contains_key(&guild_id.get()) {
+            if stream_sessions.lock().await.is_empty() {
                 break;
             }
 
-            if queues.is_empty(guild_id).await {
-                baseline = crate::smtc::run_smtc(crate::smtc::now_playing)
-                    .await
-                    .ok()
-                    .flatten();
+            if guard.recently_programmatic().await {
                 continue;
             }
 
-            if guard.recently_programmatic(guild_id).await {
+            let intentional = session.get_intentional().await;
+            let now = crate::smtc::run_smtc(crate::smtc::now_playing)
+                .await
+                .ok()
+                .flatten();
+
+            // Refresh artist metadata when title still matches (oEmbed vs SMTC drift).
+            if let (Some(np), Some(intent)) = (&now, &intentional) {
+                if smtc_title_matches_intentional(np, intent) && !metadata_matches_track(np, intent)
+                {
+                    session
+                        .set_intentional(track_info_from_smtc(np, &intent.uri))
+                        .await;
+                }
+            }
+
+            if queues.is_empty().await {
                 continue;
             }
 
-            // Preempt before Spotify autoplay advances to the next album/playlist track.
+            // Preempt before track end so Spotify autoplay does not start.
             if let Ok((crate::smtc::PlaybackStatus::Playing, _)) =
                 crate::smtc::run_smtc(crate::smtc::playback_snapshot).await
             {
@@ -373,54 +652,24 @@ pub fn spawn_queue_watcher(
                     if timeline.position >= MIN_PLAYED_BEFORE_PREEMPT
                         && timeline.remaining() <= QUEUE_PREEMPT_BEFORE_END
                     {
-                        if let Some(next) = queues.pop_front(guild_id).await {
-                            tracing::info!(
-                                "Spotify queue preempt ({}ms left): {}",
-                                timeline.remaining().as_millis(),
-                                next.label
-                            );
-                            guard.note(guild_id).await;
-                            if advance_local_playback(&next.uri).await.is_ok() {
-                                baseline = crate::smtc::run_smtc(crate::smtc::now_playing)
-                                    .await
-                                    .ok()
-                                    .flatten();
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Fallback if preempt missed (e.g. no timeline from SMTC).
-            let now = match crate::smtc::run_smtc(crate::smtc::now_playing).await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let changed = match (&baseline, &now) {
-                (Some(b), Some(n)) => crate::smtc::metadata_differs(b, n),
-                (None, Some(n)) => n.title.is_some(),
-                _ => false,
-            };
-
-            if changed {
-                if let Some(next) = queues.pop_front(guild_id).await {
-                    tracing::info!("Spotify queue auto-advance (metadata): {}", next.label);
-                    guard.note(guild_id).await;
-                    if advance_local_playback(&next.uri).await.is_ok() {
-                        baseline = crate::smtc::run_smtc(crate::smtc::now_playing)
-                            .await
-                            .ok()
-                            .flatten();
+                        try_advance_queue(&queues, &guard, &session, "preempt").await;
                         continue;
                     }
                 }
             }
 
-            baseline = now.or(baseline);
+            // Spotify moved to a different *title* — take back control from the queue.
+            match (&now, &intentional) {
+                (Some(np), Some(intent)) if !smtc_title_matches_intentional(np, intent) => {
+                    try_advance_queue(&queues, &guard, &session, "autoplay-override").await;
+                }
+                (Some(_), None) => {
+                    try_advance_queue(&queues, &guard, &session, "no-intentional").await;
+                }
+                _ => {}
+            }
         }
-    });
+    })
 }
 
 /// Open a Spotify URI on the local machine using the system's default handler.

@@ -26,6 +26,8 @@ pub struct Handler {
     pub stream_sessions: Arc<Mutex<HashMap<u64, stream::StreamSession>>>,
     pub spotify_queues: Arc<crate::playback::SpotifyQueues>,
     pub spotify_playback_guard: Arc<spotify::SpotifyPlaybackGuard>,
+    pub spotify_session: Arc<crate::playback::SpotifySessionTracker>,
+    pub spotify_queue_watcher: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     /// In-flight `/spotify play` tasks — aborted by `/stop`.
     pub spotify_play_tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>,
 }
@@ -48,6 +50,7 @@ pub async fn run_bot() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let playback_modes = crate::playback::PlaybackModes::new();
     let spotify_queues = crate::playback::SpotifyQueues::new();
     let spotify_playback_guard = spotify::SpotifyPlaybackGuard::new();
+    let spotify_session = crate::playback::SpotifySessionTracker::new();
     let voice_idle = music::VoiceIdleManager::new(playback_modes.clone());
     let handler = Handler {
         guild_id,
@@ -59,6 +62,8 @@ pub async fn run_bot() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stream_sessions: Arc::new(Mutex::new(HashMap::new())),
         spotify_queues,
         spotify_playback_guard,
+        spotify_session,
+        spotify_queue_watcher: Arc::new(Mutex::new(None)),
         spotify_play_tasks: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -226,6 +231,16 @@ impl EventHandler for Handler {
 
 impl Handler {
     /// Abort a running `/spotify play` background task for this guild, if any.
+    async fn spotify_stream_active(&self) -> bool {
+        !self.stream_sessions.lock().await.is_empty()
+    }
+
+    async fn stop_spotify_queue_watcher(&self) {
+        if let Some(handle) = self.spotify_queue_watcher.lock().await.take() {
+            handle.abort();
+        }
+    }
+
     async fn cancel_spotify_play(&self, guild_id: serenity::all::GuildId) {
         if let Some(handle) = self.spotify_play_tasks.lock().await.remove(&guild_id.get()) {
             handle.abort();
@@ -396,27 +411,31 @@ impl Handler {
         guild_id: serenity::all::GuildId,
     ) {
         let mode = self.playback_modes.get(guild_id).await;
-        let result: Result<(), String> = match mode {
-            GuildPlayback::Spotify => {
-                spotify::skip_or_play_next(
-                    guild_id,
-                    &self.spotify_queues,
-                    &self.spotify_playback_guard,
-                )
-                .await
+        let spotify_active = self.spotify_stream_active().await;
+        let result: Result<(), String> = if spotify_active {
+            spotify::skip_or_play_next(
+                &self.spotify_queues,
+                &self.spotify_playback_guard,
+                &self.spotify_session,
+            )
+            .await
+        } else {
+            match mode {
+                GuildPlayback::Youtube => music::skip(&self.songbird, guild_id).await,
+                GuildPlayback::Idle => Err("Nothing is playing.".into()),
+                GuildPlayback::Spotify => Err("Nothing is playing.".into()),
             }
-            GuildPlayback::Youtube => {
-                music::skip(&self.songbird, guild_id).await
-            }
-            GuildPlayback::Idle => Err("Nothing is playing.".into()),
         };
         self.handle_result(
             ctx,
             cmd,
-            match mode {
-                GuildPlayback::Spotify => "⏭ Skipped Spotify track.",
-                GuildPlayback::Youtube => "⏭ Skipped.",
-                GuildPlayback::Idle => "⏭ Skipped.",
+            if spotify_active {
+                "⏭ Skipped Spotify track."
+            } else {
+                match mode {
+                    GuildPlayback::Youtube => "⏭ Skipped.",
+                    _ => "⏭ Skipped.",
+                }
             },
             result,
         )
@@ -430,22 +449,26 @@ impl Handler {
         guild_id: serenity::all::GuildId,
     ) {
         let mode = self.playback_modes.get(guild_id).await;
-        let result: Result<(), String> = match mode {
-            GuildPlayback::Spotify => {
-                crate::smtc::run_smtc(crate::smtc::pause).await
+        let spotify_active = self.spotify_stream_active().await;
+        let result: Result<(), String> = if spotify_active {
+            crate::smtc::run_smtc(crate::smtc::pause).await
+        } else {
+            match mode {
+                GuildPlayback::Youtube => music::pause(&self.songbird, guild_id).await,
+                GuildPlayback::Idle => Err("Nothing is playing.".into()),
+                GuildPlayback::Spotify => Err("Nothing is playing.".into()),
             }
-            GuildPlayback::Youtube => {
-                music::pause(&self.songbird, guild_id).await
-            }
-            GuildPlayback::Idle => Err("Nothing is playing.".into()),
         };
         self.handle_result(
             ctx,
             cmd,
-            match mode {
-                GuildPlayback::Spotify => "⏸ Paused Spotify.",
-                GuildPlayback::Youtube => "⏸ Paused.",
-                GuildPlayback::Idle => "⏸ Paused.",
+            if spotify_active {
+                "⏸ Paused Spotify."
+            } else {
+                match mode {
+                    GuildPlayback::Youtube => "⏸ Paused.",
+                    _ => "⏸ Paused.",
+                }
             },
             result,
         )
@@ -459,22 +482,26 @@ impl Handler {
         guild_id: serenity::all::GuildId,
     ) {
         let mode = self.playback_modes.get(guild_id).await;
-        let result: Result<(), String> = match mode {
-            GuildPlayback::Spotify => {
-                crate::smtc::run_smtc(crate::smtc::resume).await
+        let spotify_active = self.spotify_stream_active().await;
+        let result: Result<(), String> = if spotify_active {
+            crate::smtc::run_smtc(crate::smtc::resume).await
+        } else {
+            match mode {
+                GuildPlayback::Youtube => music::resume(&self.songbird, guild_id).await,
+                GuildPlayback::Idle => Err("Nothing is playing.".into()),
+                GuildPlayback::Spotify => Err("Nothing is playing.".into()),
             }
-            GuildPlayback::Youtube => {
-                music::resume(&self.songbird, guild_id).await
-            }
-            GuildPlayback::Idle => Err("Nothing is playing.".into()),
         };
         self.handle_result(
             ctx,
             cmd,
-            match mode {
-                GuildPlayback::Spotify => "▶ Resumed Spotify.",
-                GuildPlayback::Youtube => "▶ Resumed.",
-                GuildPlayback::Idle => "▶ Resumed.",
+            if spotify_active {
+                "▶ Resumed Spotify."
+            } else {
+                match mode {
+                    GuildPlayback::Youtube => "▶ Resumed.",
+                    _ => "▶ Resumed.",
+                }
             },
             result,
         )
@@ -510,7 +537,12 @@ impl Handler {
         )
         .await;
 
-        self.spotify_queues.clear(guild_id).await;
+        let streams_empty = self.stream_sessions.lock().await.is_empty();
+        if streams_empty {
+            self.spotify_queues.clear().await;
+            self.spotify_session.clear().await;
+            self.stop_spotify_queue_watcher().await;
+        }
 
         let content = match result {
             Ok(()) => "⏹ Stopped and left voice channel.".to_string(),
@@ -557,9 +589,9 @@ impl Handler {
             }
             "skip" => {
                 let result = spotify::skip_or_play_next(
-                    guild_id,
                     &self.spotify_queues,
                     &self.spotify_playback_guard,
+                    &self.spotify_session,
                 )
                 .await;
                 self.handle_result(ctx, cmd, "⏭ Skipped Spotify track.", result)
@@ -632,21 +664,59 @@ impl Handler {
             return;
         }
 
-        // Already streaming — queue the link without interrupting playback or capture.
-        if self.stream_sessions.lock().await.contains_key(&guild_id.get())
-            && self.playback_modes.get(guild_id).await == GuildPlayback::Spotify
-        {
-            let label = spotify::fetch_link_title(&self.http_client, &spotify_uri, &url).await;
-            let position = self
-                .spotify_queues
-                .push(guild_id, spotify_uri, label.clone())
-                .await;
+        // One Spotify desktop app → queue whenever any voice stream is up or starting.
+        let spotify_active = self.spotify_stream_active().await
+            || !self.spotify_play_tasks.lock().await.is_empty();
+        if spotify_active {
+            let meta = spotify::fetch_link_metadata(&self.http_client, &spotify_uri, &url).await;
+            if let Some(current) = self.spotify_session.get_intentional().await {
+                if current.same_uri(&meta.uri) {
+                    let _ = cmd
+                        .edit_response(
+                            &ctx.http,
+                            serenity::builder::EditInteractionResponse::new().content(format!(
+                                "Already playing **{}**.",
+                                current.display()
+                            )),
+                        )
+                        .await;
+                    return;
+                }
+            }
+            if let Ok(Some(np)) = crate::smtc::run_smtc(crate::smtc::now_playing).await {
+                if spotify::metadata_matches_track(&np, &meta) {
+                    let _ = cmd
+                        .edit_response(
+                            &ctx.http,
+                            serenity::builder::EditInteractionResponse::new().content(format!(
+                                "Already playing **{}**.",
+                                meta.display()
+                            )),
+                        )
+                        .await;
+                    return;
+                }
+            }
+            if self.spotify_queues.contains_uri(&meta.uri).await {
+                let _ = cmd
+                    .edit_response(
+                        &ctx.http,
+                        serenity::builder::EditInteractionResponse::new().content(format!(
+                            "Already in queue: **{}**.",
+                            meta.display()
+                        )),
+                    )
+                    .await;
+                return;
+            }
+            let position = self.spotify_queues.push(meta.clone()).await;
             let _ = cmd
                 .edit_response(
                     &ctx.http,
                     serenity::builder::EditInteractionResponse::new().content(format!(
-                        "🎵 Queued `#{position}`: **{label}**\n\
-                         Use `/skip` for the next track, or `/spotify queue` to see the list."
+                        "🎵 Queued `#{position}`: **{}**\n\
+                         Use `/skip` for the next track, or `/spotify queue` to see the list.",
+                        meta.display()
                     )),
                 )
                 .await;
@@ -661,6 +731,8 @@ impl Handler {
         let playback_modes = self.playback_modes.clone();
         let spotify_queues = self.spotify_queues.clone();
         let spotify_playback_guard = self.spotify_playback_guard.clone();
+        let spotify_session = self.spotify_session.clone();
+        let spotify_queue_watcher = self.spotify_queue_watcher.clone();
         let http = ctx.http.clone();
         let ctx = ctx.clone();
         let cmd = cmd.clone();
@@ -742,8 +814,9 @@ impl Handler {
                 }
             };
 
-            let track_label = spotify::now_playing_label(&now_playing, &spotify_uri);
-            spotify_playback_guard.note(guild_id).await;
+            let track = spotify::track_info_from_smtc(&now_playing, &spotify_uri);
+            spotify_playback_guard.note().await;
+            spotify_session.set_intentional(track.clone()).await;
             edit(format!(
                 "🎵 Spotify is playing — waiting for audio on:\n\
                  `{device}`"
@@ -761,14 +834,20 @@ impl Handler {
                     playback_modes
                         .set(guild_id, GuildPlayback::Spotify)
                         .await;
-                    spotify::spawn_queue_watcher(
-                        guild_id,
-                        spotify_queues.clone(),
-                        spotify_playback_guard.clone(),
-                        stream_sessions.clone(),
-                    );
+                    {
+                        let mut slot = spotify_queue_watcher.lock().await;
+                        if slot.is_none() {
+                            let watcher = spotify::spawn_queue_watcher(
+                                spotify_queues.clone(),
+                                spotify_playback_guard.clone(),
+                                spotify_session.clone(),
+                                stream_sessions.clone(),
+                            );
+                            *slot = Some(watcher.abort_handle());
+                        }
+                    }
                     tracing::info!("Spotify cable stream active for guild {guild_id}");
-                    let queued = spotify_queues.len(guild_id).await;
+                    let queued = spotify_queues.len().await;
                     let queue_note = if queued > 0 {
                         format!("\n`{queued}` track(s) queued — `/skip` for next.")
                     } else {
@@ -776,8 +855,9 @@ impl Handler {
                     };
                     edit(format!(
                         "🎵 Playing Spotify.\n\
-                         `{track_label}`\n\
-                         Streaming via `{device}`.{queue_note}"
+                         `{}`\n\
+                         Streaming via `{device}`.{queue_note}",
+                        track.display(),
                     ))
                     .await;
                 }
@@ -795,9 +875,10 @@ impl Handler {
                 Err(_) => {
                     tracing::error!("Spotify stream timed out for guild {guild_id}");
                     edit(format!(
-                        "Timed out starting Discord stream for `{track_label}`.\n\
+                        "Timed out starting Discord stream for `{}`.\n\
                          Audio on `{device}` or voice join took too long.\n\
-                         Try `/spotify probe` while Spotify plays (not during `/spotify play`)."
+                         Try `/spotify probe` while Spotify plays (not during `/spotify play`).",
+                        track.display(),
                     ))
                     .await;
                 }
@@ -875,7 +956,7 @@ impl Handler {
         &self,
         ctx: &Context,
         cmd: &CommandInteraction,
-        guild_id: serenity::all::GuildId,
+        _guild_id: serenity::all::GuildId,
     ) {
         let _ = cmd
             .create_response(
@@ -884,7 +965,7 @@ impl Handler {
             )
             .await;
 
-        let now_playing = if self.playback_modes.get(guild_id).await == GuildPlayback::Spotify {
+        let now_playing = if self.spotify_stream_active().await {
             crate::smtc::run_smtc(crate::smtc::now_playing)
                 .await
                 .ok()
@@ -894,7 +975,7 @@ impl Handler {
             None
         };
 
-        let queue = self.spotify_queues.list(guild_id).await;
+        let queue = self.spotify_queues.list().await;
         let body = spotify::format_queue_message(now_playing.as_deref(), &queue);
 
         let _ = cmd

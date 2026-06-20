@@ -41,61 +41,107 @@ impl PlaybackModes {
     }
 }
 
-/// A Spotify link waiting to play after the current track.
+/// Canonical Spotify item identity for queue display and matching.
 #[derive(Clone, Debug)]
-pub struct QueuedSpotify {
+pub struct SpotifyTrackInfo {
     pub uri: SpotifyUri,
-    pub label: String,
+    pub title: String,
+    pub artist: Option<String>,
 }
 
-/// Per-guild Spotify URI queue (separate from Songbird's YouTube track queue).
+impl SpotifyTrackInfo {
+    /// Discord-facing label — always `Title — Artist` when artist is known.
+    pub fn display(&self) -> String {
+        match self.artist.as_deref().filter(|a| !a.is_empty()) {
+            Some(artist) => format!("{} — {}", self.title, artist),
+            None => self.title.clone(),
+        }
+    }
+
+    pub fn same_uri(&self, other: &SpotifyUri) -> bool {
+        self.uri.kind == other.kind && self.uri.id == other.id
+    }
+}
+
+/// A Spotify link waiting to play after the current track.
+pub type QueuedSpotify = SpotifyTrackInfo;
+
+/// Shared Spotify queue — one desktop Spotify instance, one queue for the whole bot.
 pub struct SpotifyQueues {
-    inner: Mutex<HashMap<u64, VecDeque<QueuedSpotify>>>,
+    inner: Mutex<VecDeque<QueuedSpotify>>,
 }
 
 impl SpotifyQueues {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(VecDeque::new()),
         })
     }
 
     /// Append a track; returns its 1-based queue position.
-    pub async fn push(&self, guild_id: GuildId, uri: SpotifyUri, label: String) -> usize {
-        let mut map = self.inner.lock().await;
-        let queue = map.entry(guild_id.get()).or_default();
-        queue.push_back(QueuedSpotify { uri, label });
+    pub async fn push(&self, item: SpotifyTrackInfo) -> usize {
+        let mut queue = self.inner.lock().await;
+        queue.push_back(item);
         queue.len()
     }
 
-    pub async fn pop_front(&self, guild_id: GuildId) -> Option<QueuedSpotify> {
-        let mut map = self.inner.lock().await;
-        map.get_mut(&guild_id.get())?.pop_front()
-    }
-
-    pub async fn len(&self, guild_id: GuildId) -> usize {
+    pub async fn contains_uri(&self, uri: &SpotifyUri) -> bool {
         self.inner
             .lock()
             .await
-            .get(&guild_id.get())
-            .map(|q| q.len())
-            .unwrap_or(0)
+            .iter()
+            .any(|item| item.same_uri(uri))
     }
 
-    pub async fn is_empty(&self, guild_id: GuildId) -> bool {
-        self.len(guild_id).await == 0
+    pub async fn pop_front(&self) -> Option<QueuedSpotify> {
+        self.inner.lock().await.pop_front()
     }
 
-    pub async fn clear(&self, guild_id: GuildId) {
-        self.inner.lock().await.remove(&guild_id.get());
+    pub async fn peek_front(&self) -> Option<QueuedSpotify> {
+        self.inner.lock().await.front().cloned()
     }
 
-    pub async fn list(&self, guild_id: GuildId) -> Vec<QueuedSpotify> {
-        self.inner
-            .lock()
-            .await
-            .get(&guild_id.get())
-            .map(|q| q.iter().cloned().collect())
-            .unwrap_or_default()
+    pub async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
+    pub async fn clear(&self) {
+        self.inner.lock().await.clear();
+    }
+
+    pub async fn list(&self) -> Vec<QueuedSpotify> {
+        self.inner.lock().await.iter().cloned().collect()
+    }
+}
+
+/// Track the song the bot deliberately started (vs Spotify autoplay drift).
+pub type IntentionalTrack = SpotifyTrackInfo;
+
+/// What Spotify is supposed to be playing right now (global — one SMTC session).
+pub struct SpotifySessionTracker {
+    intentional: Mutex<Option<IntentionalTrack>>,
+}
+
+impl SpotifySessionTracker {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            intentional: Mutex::new(None),
+        })
+    }
+
+    pub async fn set_intentional(&self, track: IntentionalTrack) {
+        *self.intentional.lock().await = Some(track);
+    }
+
+    pub async fn get_intentional(&self) -> Option<IntentionalTrack> {
+        self.intentional.lock().await.clone()
+    }
+
+    pub async fn clear(&self) {
+        *self.intentional.lock().await = None;
     }
 }
