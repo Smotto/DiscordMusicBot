@@ -172,6 +172,7 @@ pub async fn fetch_link_metadata(
         uri: spotify.clone(),
         title,
         artist: artist.map(|a| sanitize_artist(&a)).filter(|a| !a.is_empty()),
+        requested_by: None,
     }
 }
 
@@ -325,7 +326,17 @@ pub fn track_info_from_smtc(np: &crate::smtc::NowPlaying, uri: &SpotifyUri) -> S
             .as_deref()
             .map(sanitize_artist)
             .filter(|a| !a.is_empty()),
+        requested_by: None,
     }
+}
+
+fn intentional_track_from_smtc(
+    np: &crate::smtc::NowPlaying,
+    source: &SpotifyTrackInfo,
+) -> SpotifyTrackInfo {
+    let mut track = track_info_from_smtc(np, &source.uri);
+    track.requested_by = source.requested_by.clone();
+    track
 }
 
 /// Format SMTC metadata for Discord messages.
@@ -355,7 +366,7 @@ pub fn format_queue_list(queue: &[QueuedSpotify], max: usize) -> String {
         .iter()
         .take(max)
         .enumerate()
-        .map(|(i, item)| format!("`{}.` {}", i + 1, item.display()))
+        .map(|(i, item)| item.queue_line(i + 1))
         .collect();
     if queue.len() > max {
         lines.push(format!("_+{} more_", queue.len() - max));
@@ -424,14 +435,37 @@ pub async fn is_playback_active() -> bool {
 }
 
 /// Label for the status board — hides stale metadata when playback has stopped or finished.
-pub async fn status_board_now_playing() -> Option<String> {
+pub async fn status_board_now_playing(session: &SpotifySessionTracker) -> Option<String> {
     if is_playback_idle().await {
         return None;
     }
     let (_, np) = crate::smtc::run_smtc(crate::smtc::playback_snapshot)
         .await
         .ok()?;
-    np.map(|meta| format_now_playing(&meta))
+    let np = np?;
+    let track_label = format_now_playing(&np);
+    let intentional = session.get_intentional().await;
+
+    let bot_controlled = intentional.as_ref().is_some_and(|intent| {
+        smtc_title_matches_intentional(&np, intent) || metadata_matches_track(&np, intent)
+    });
+
+    if bot_controlled {
+        let requester = intentional
+            .as_ref()
+            .and_then(|intent| intent.requested_by.as_deref());
+        Some(crate::playback::format_now_playing_attribution(
+            &track_label,
+            requester,
+            false,
+        ))
+    } else {
+        Some(crate::playback::format_now_playing_attribution(
+            &track_label,
+            None,
+            true,
+        ))
+    }
 }
 
 /// Update the pinned status message after queue or playback changes.
@@ -439,12 +473,13 @@ pub async fn refresh_status_board_message(
     board: &crate::spotify_status::SpotifyStatusBoard,
     http: &serenity::http::Http,
     queues: &SpotifyQueues,
+    session: &SpotifySessionTracker,
     footer: Option<&str>,
 ) {
     let Some(channel_id) = board.channel_id().await else {
         return;
     };
-    let now_playing = status_board_now_playing().await;
+    let now_playing = status_board_now_playing(session).await;
     let queue = queues.list().await;
     let embed = build_status_embed(now_playing.as_deref(), &queue, footer);
     board.refresh(http, channel_id, embed).await;
@@ -455,10 +490,12 @@ pub async fn play_on_existing_stream(
     spotify_uri: &SpotifyUri,
     guard: &SpotifyPlaybackGuard,
     session: &SpotifySessionTracker,
+    requested_by: Option<String>,
 ) -> Result<SpotifyTrackInfo, String> {
     let np = start_local_playback(spotify_uri).await?;
     guard.note().await;
-    let track = track_info_from_smtc(&np, spotify_uri);
+    let mut track = track_info_from_smtc(&np, spotify_uri);
+    track.requested_by = requested_by;
     session.set_intentional(track.clone()).await;
     Ok(track)
 }
@@ -637,7 +674,7 @@ async fn try_advance_queue(
         queues.pop_front().await;
         if let Some(np) = live {
             session
-                .set_intentional(track_info_from_smtc(&np, &next.uri))
+                .set_intentional(intentional_track_from_smtc(&np, &next))
                 .await;
         }
         tracing::info!(
@@ -667,7 +704,7 @@ async fn try_advance_queue(
             guard.note().await;
             queues.pop_front().await;
             session
-                .set_intentional(track_info_from_smtc(&np, &next.uri))
+                .set_intentional(intentional_track_from_smtc(&np, &next))
                 .await;
             tracing::info!("Spotify queue advance ({reason}): {}", next.display());
             true
@@ -728,7 +765,7 @@ pub fn spawn_queue_watcher(
             if queues.is_empty().await {
                 if is_playback_idle().await {
                     session.clear().await;
-                    refresh_status_board_message(&status_board, &http, &queues, None).await;
+                    refresh_status_board_message(&status_board, &http, &queues, &session, None).await;
                 }
                 continue;
             }
@@ -736,7 +773,7 @@ pub fn spawn_queue_watcher(
             // Track ended (Stopped or Paused at end) with items waiting — start the queue.
             if is_playback_idle().await {
                 if try_advance_queue(&queues, &guard, &session, "idle").await {
-                    refresh_status_board_message(&status_board, &http, &queues, None).await;
+                    refresh_status_board_message(&status_board, &http, &queues, &session, None).await;
                 }
                 continue;
             }
@@ -752,7 +789,7 @@ pub fn spawn_queue_watcher(
                 if smtc_title_matches_intentional(np, intent) && !metadata_matches_track(np, intent)
                 {
                     session
-                        .set_intentional(track_info_from_smtc(np, &intent.uri))
+                        .set_intentional(intentional_track_from_smtc(np, intent))
                         .await;
                 }
             }
@@ -768,7 +805,7 @@ pub fn spawn_queue_watcher(
                         && timeline.remaining() <= QUEUE_PREEMPT_BEFORE_END
                     {
                         if try_advance_queue(&queues, &guard, &session, "preempt").await {
-                            refresh_status_board_message(&status_board, &http, &queues, None).await;
+                            refresh_status_board_message(&status_board, &http, &queues, &session, None).await;
                         }
                         continue;
                     }
@@ -779,12 +816,12 @@ pub fn spawn_queue_watcher(
             match (&now, &intentional) {
                 (Some(np), Some(intent)) if !smtc_title_matches_intentional(np, intent) => {
                     if try_advance_queue(&queues, &guard, &session, "autoplay-override").await {
-                        refresh_status_board_message(&status_board, &http, &queues, None).await;
+                        refresh_status_board_message(&status_board, &http, &queues, &session, None).await;
                     }
                 }
                 (Some(_), None) => {
                     if try_advance_queue(&queues, &guard, &session, "no-intentional").await {
-                        refresh_status_board_message(&status_board, &http, &queues, None).await;
+                        refresh_status_board_message(&status_board, &http, &queues, &session, None).await;
                     }
                 }
                 _ => {}

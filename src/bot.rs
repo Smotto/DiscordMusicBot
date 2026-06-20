@@ -31,6 +31,7 @@ pub struct Handler {
     pub spotify_status_board: Arc<crate::spotify_status::SpotifyStatusBoard>,
     /// In-flight `/spotify play` tasks — aborted by `/stop`.
     pub spotify_play_tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>,
+    pub spotify_capture_recovery_registered: Arc<Mutex<HashSet<u64>>>,
 }
 
 fn ack(msg: impl Into<String>) -> CreateInteractionResponse {
@@ -49,10 +50,11 @@ pub async fn run_bot() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         SongbirdConfig::default().gateway_timeout(Some(Duration::from_secs(30))),
     );
     let playback_modes = crate::playback::PlaybackModes::new();
+    let stream_sessions = Arc::new(Mutex::new(HashMap::new()));
     let spotify_queues = crate::playback::SpotifyQueues::new();
     let spotify_playback_guard = spotify::SpotifyPlaybackGuard::new();
     let spotify_session = crate::playback::SpotifySessionTracker::new();
-    let voice_idle = music::VoiceIdleManager::new(playback_modes.clone());
+    let voice_idle = music::VoiceIdleManager::new(playback_modes.clone(), stream_sessions.clone());
     let handler = Handler {
         guild_id,
         http_client: reqwest::Client::new(),
@@ -60,13 +62,14 @@ pub async fn run_bot() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         track_events_registered: Arc::new(Mutex::new(HashSet::new())),
         voice_idle: voice_idle.clone(),
         playback_modes,
-        stream_sessions: Arc::new(Mutex::new(HashMap::new())),
+        stream_sessions,
         spotify_queues,
         spotify_playback_guard,
         spotify_session,
         spotify_queue_watcher: Arc::new(Mutex::new(None)),
         spotify_status_board: crate::spotify_status::SpotifyStatusBoard::new(),
         spotify_play_tasks: Arc::new(Mutex::new(HashMap::new())),
+        spotify_capture_recovery_registered: Arc::new(Mutex::new(HashSet::new())),
     };
 
     let mut client = Client::builder(token, intents)
@@ -198,12 +201,40 @@ impl EventHandler for Handler {
     async fn voice_state_update(
         &self,
         ctx: Context,
-        _before: Option<serenity::all::VoiceState>,
+        before: Option<serenity::all::VoiceState>,
         after: serenity::all::VoiceState,
     ) {
         if after.user_id == ctx.cache.current_user().id {
             tracing::info!("Bot voice state update: channel={:?}", after.channel_id);
+            return;
         }
+
+        let Some(guild_id) = after.guild_id else {
+            return;
+        };
+
+        let left_channel = before.as_ref().and_then(|b| b.channel_id);
+        if left_channel.is_none() || after.channel_id.is_some() {
+            return;
+        }
+
+        let Some(handler_lock) = self.songbird.get(guild_id) else {
+            return;
+        };
+        let bot_channel = handler_lock.lock().await.current_channel().map(|c| c.0.get());
+        if bot_channel != left_channel.map(|c| c.get()) {
+            return;
+        }
+
+        stream::schedule_capture_recovery(
+            "user-left-vc",
+            self.songbird.clone(),
+            guild_id,
+            self.voice_idle.clone(),
+            self.stream_sessions.clone(),
+            self.playback_modes.clone(),
+        )
+        .await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -256,11 +287,18 @@ impl Handler {
         spotify::is_playback_active().await
     }
 
+    fn spotify_requester(cmd: &CommandInteraction) -> String {
+        cmd.user
+            .global_name
+            .clone()
+            .unwrap_or_else(|| cmd.user.name.clone())
+    }
+
     async fn spotify_status_snapshot(
         &self,
     ) -> (Option<String>, Vec<crate::playback::QueuedSpotify>) {
         let now_playing = if self.spotify_stream_active().await {
-            spotify::status_board_now_playing().await
+            spotify::status_board_now_playing(&self.spotify_session).await
         } else {
             None
         };
@@ -766,10 +804,12 @@ impl Handler {
 
         // Voice stream up but Spotify stopped — play immediately, don't queue.
         if stream_up && !should_queue {
+            let requester = Some(Self::spotify_requester(cmd));
             match spotify::play_on_existing_stream(
                 &spotify_uri,
                 &self.spotify_playback_guard,
                 &self.spotify_session,
+                requester,
             )
             .await
             {
@@ -802,7 +842,9 @@ impl Handler {
 
         // Queue while something is actively playing/paused or already lined up.
         if should_queue {
-            let meta = spotify::fetch_link_metadata(&self.http_client, &spotify_uri, &url).await;
+            let requester = Some(Self::spotify_requester(cmd));
+            let mut meta = spotify::fetch_link_metadata(&self.http_client, &spotify_uri, &url).await;
+            meta.requested_by = requester;
             let playback_active = spotify::is_playback_active().await;
             if playback_active {
                 if let Some(current) = self.spotify_session.get_intentional().await {
@@ -877,6 +919,8 @@ impl Handler {
         let ctx = ctx.clone();
         let cmd = cmd.clone();
         let spotify_play_tasks = self.spotify_play_tasks.clone();
+        let spotify_capture_recovery_registered = self.spotify_capture_recovery_registered.clone();
+        let requester = Some(Self::spotify_requester(&cmd));
 
         self.cancel_spotify_play(guild_id).await;
 
@@ -952,13 +996,21 @@ impl Handler {
                 }
             };
 
-            let track = spotify::track_info_from_smtc(&now_playing, &spotify_uri);
+            let mut track = spotify::track_info_from_smtc(&now_playing, &spotify_uri);
+            track.requested_by = requester;
             spotify_playback_guard.note().await;
             spotify_session.set_intentional(track.clone()).await;
 
             match tokio::time::timeout(
                 Duration::from_secs(90),
-                stream::start_guild_stream(&songbird, guild_id, idle),
+                stream::start_guild_stream(
+                    &songbird,
+                    guild_id,
+                    idle,
+                    &spotify_capture_recovery_registered,
+                    stream_sessions.clone(),
+                    playback_modes.clone(),
+                ),
             )
             .await
             {
@@ -984,7 +1036,7 @@ impl Handler {
                     tracing::info!("Spotify cable stream active for guild {guild_id}");
                     let queue = spotify_queues.list().await;
                     let embed = spotify::build_status_embed(
-                        Some(&track.display()),
+                        Some(&track.format_controlled_now_playing()),
                         &queue,
                         None,
                     );

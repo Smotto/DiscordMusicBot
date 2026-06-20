@@ -47,6 +47,8 @@ pub struct SpotifyTrackInfo {
     pub uri: SpotifyUri,
     pub title: String,
     pub artist: Option<String>,
+    /// Discord display name of whoever queued or `/spotify play`'d this track.
+    pub requested_by: Option<String>,
 }
 
 impl SpotifyTrackInfo {
@@ -58,8 +60,37 @@ impl SpotifyTrackInfo {
         }
     }
 
+    /// Numbered queue row with optional requester attribution.
+    pub fn queue_line(&self, position: usize) -> String {
+        let track = self.display();
+        match self.requested_by.as_deref() {
+            Some(user) => format!("`{position}.` {track} · **{user}**"),
+            None => format!("`{position}.` {track}"),
+        }
+    }
+
+    /// Now-playing embed line when the bot deliberately started this track.
+    pub fn format_controlled_now_playing(&self) -> String {
+        format_now_playing_attribution(&self.display(), self.requested_by.as_deref(), false)
+    }
+
     pub fn same_uri(&self, other: &SpotifyUri) -> bool {
         self.uri.kind == other.kind && self.uri.id == other.id
+    }
+}
+
+/// Embed field body for the active track (bot-requested vs Spotify autoplay).
+pub fn format_now_playing_attribution(
+    track: &str,
+    requested_by: Option<&str>,
+    autoplay: bool,
+) -> String {
+    if autoplay {
+        format!("**{track}**\n*Spotify autoplay — not from bot queue*")
+    } else if let Some(user) = requested_by {
+        format!("**{track}**\nRequested by **{user}**")
+    } else {
+        format!("**{track}**")
     }
 }
 
