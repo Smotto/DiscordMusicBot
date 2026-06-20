@@ -176,6 +176,17 @@ impl ParkedMixer {
 
                 Ok(false)
             },
+            MixerMessage::ReassertSpeaking => {
+                if self
+                    .mixer
+                    .tracks
+                    .iter()
+                    .any(|track| track.playing.is_playing())
+                {
+                    let _ = self.send_gateway_speaking();
+                }
+                Ok(false)
+            },
             msg => {
                 let (events_failure, conn_failure, should_exit) =
                     self.mixer.handle_message(msg, &mut []);

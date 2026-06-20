@@ -377,7 +377,8 @@ impl AuxNetwork {
                     .insert(ev.transition_id, ev.protocol_version);
 
                 if ev.transition_id == 0 {
-                    self.execute_dave_transition(ev.transition_id).await;
+                    self.execute_dave_transition(interconnect, ev.transition_id)
+                        .await;
                 } else if ev.protocol_version == 0 {
                     if let Some(ref mut dave_session) = *self.dave_session.write().unwrap() {
                         dave_session.set_passthrough_mode(true, Some(120));
@@ -396,7 +397,8 @@ impl AuxNetwork {
                     "DAVE: Received DaveExecuteTransition (transition_id={})",
                     ev.transition_id
                 );
-                self.execute_dave_transition(ev.transition_id).await;
+                self.execute_dave_transition(interconnect, ev.transition_id)
+                    .await;
             },
             GatewayEvent::DavePrepareEpoch(ev) if ev.epoch == 1 => {
                 info!("DAVE: Received DavePrepareEpoch (protocol_version={})", ev.protocol_version);
@@ -540,13 +542,13 @@ impl AuxNetwork {
                         },
                         Some(Ok(())) => {
                             info!("DAVE: Commit processed for transition_id=0");
-                            self.try_enable_dave_media().await;
+                            self.try_enable_dave_media(interconnect).await;
                         },
                         Some(Err(e)) if is_stale_dave_commit_error(&e) => {
                             tracing::debug!(
                                 "DAVE: Stale commit announcement ignored: {e:?}"
                             );
-                            self.try_enable_dave_media().await;
+                            self.try_enable_dave_media(interconnect).await;
                         },
                         Some(Err(e)) => {
                             warn!("MLS commit errored: {e:?}");
@@ -608,7 +610,7 @@ impl AuxNetwork {
                     },
                     Some(Ok(())) => {
                         info!("DAVE: Welcome processed for transition_id={}", ev.transition_id);
-                        self.try_enable_dave_media().await;
+                            self.try_enable_dave_media(interconnect).await;
                     },
                     None => {},
                 }
@@ -619,7 +621,7 @@ impl AuxNetwork {
                 };
                 info!("DAVE: After welcome, is_ready={}", is_ready);
                 if is_ready {
-                    self.try_enable_dave_media().await;
+                            self.try_enable_dave_media(interconnect).await;
                 }
             },
             other => {
@@ -686,7 +688,7 @@ impl AuxNetwork {
     }
 
     /// Unblock RTP once the MLS session can encrypt and Discord allows media.
-    async fn try_enable_dave_media(&mut self) {
+    async fn try_enable_dave_media(&mut self, interconnect: &Interconnect) {
         let is_ready = self
             .dave_session
             .read()
@@ -701,8 +703,20 @@ impl AuxNetwork {
         }
         let protocol_version = self.dave_protocol_version.load(Ordering::Relaxed);
         self.dave_pending_transitions.insert(0, protocol_version);
-        self.execute_dave_transition(0).await;
+        self.execute_dave_transition(interconnect, 0).await;
         info!("DAVE: Media enabled (session is_ready=true)");
+    }
+
+    async fn notify_mixer_reassert_speaking(&self, interconnect: &Interconnect, transition_id: u16) {
+        if interconnect.mixer.send(MixerMessage::ReassertSpeaking).is_err() {
+            warn!(
+                "DAVE: Failed to notify mixer to re-assert speaking (transition_id={transition_id})"
+            );
+        } else {
+            info!(
+                "DAVE: Mixer notified to re-assert speaking (transition_id={transition_id})"
+            );
+        }
     }
 
     async fn reassert_speaking_after_dave(&mut self) {
@@ -722,7 +736,7 @@ impl AuxNetwork {
         }
     }
 
-    async fn execute_dave_transition(&mut self, transition_id: u16) {
+    async fn execute_dave_transition(&mut self, interconnect: &Interconnect, transition_id: u16) {
         let Some(new_version) = self.dave_pending_transitions.get(&transition_id).copied() else {
             warn!("Received DaveExecuteTransition for unknown transition ID {transition_id}");
             let is_ready = self
@@ -739,6 +753,8 @@ impl AuxNetwork {
                     );
                 }
                 self.reassert_speaking_after_dave().await;
+                self.notify_mixer_reassert_speaking(interconnect, transition_id)
+                    .await;
             }
             return;
         };
@@ -761,6 +777,8 @@ impl AuxNetwork {
         // Re-assert speaking now that DAVE allows media — the earlier speaking
         // packet was deferred because dave_media_allowed was false.
         self.reassert_speaking_after_dave().await;
+        self.notify_mixer_reassert_speaking(interconnect, transition_id)
+            .await;
     }
 }
 

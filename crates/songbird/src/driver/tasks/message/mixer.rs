@@ -49,6 +49,9 @@ pub enum MixerMessage {
     #[cfg(feature = "receive")]
     MarkSsrcMapped(u32),
 
+    /// Re-send gateway speaking after DAVE media is allowed again (e.g. user joined VC).
+    ReassertSpeaking,
+
     Poison,
 }
 

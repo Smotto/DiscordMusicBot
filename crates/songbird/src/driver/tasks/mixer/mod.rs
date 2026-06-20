@@ -362,6 +362,18 @@ impl Mixer {
                 }
                 Ok(())
             },
+            MixerMessage::ReassertSpeaking => {
+                if self
+                    .tracks
+                    .iter()
+                    .any(|track| track.playing.is_playing())
+                {
+                    if let Err(e) = self.send_gateway_speaking() {
+                        conn_failure |= e.should_trigger_connect();
+                    }
+                }
+                Ok(())
+            },
             MixerMessage::Poison => {
                 should_exit = true;
                 Ok(())
