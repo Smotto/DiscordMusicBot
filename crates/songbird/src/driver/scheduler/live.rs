@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use discortp::rtp::{MutableRtpPacket, RtpPacket};
@@ -213,9 +214,13 @@ impl Live {
             .enumerate()
         {
             let (block, inner) = get_memory_indices(i);
-            match mixer.mix_and_build_packet(&mut self.packets[block][inner..][..VOICE_PACKET_MAX])
-            {
+            let packet = &mut self.packets[block][inner..][..VOICE_PACKET_MAX];
+            match mixer.mix_and_build_packet(packet) {
                 Ok(written_sz) => *packet_len = written_sz,
+                Err(DriverError::Io(ref io)) if io.kind() == ErrorKind::WouldBlock => {
+                    *packet_len = 0;
+                    advance_rtp_timestamp_only(packet);
+                },
                 e => {
                     *packet_len = 0;
                     rebuild_if_err(mixer, e, &mut self.to_cull, i);
@@ -663,6 +668,15 @@ fn get_memory_indices_unscaled(idx: usize) -> (usize, usize) {
 fn get_memory_indices(idx: usize) -> (usize, usize) {
     let (block, inner_unscaled) = get_memory_indices_unscaled(idx);
     (block, inner_unscaled * VOICE_PACKET_MAX)
+}
+
+#[inline]
+fn advance_rtp_timestamp_only(packet: &mut [u8]) {
+    let mut rtp = MutableRtpPacket::new(packet).expect(
+        "FATAL: Too few bytes in self.packet for RTP header.\
+                (Blame: VOICE_PACKET_MAX?)",
+    );
+    rtp.set_timestamp(rtp.get_timestamp() + MONO_FRAME_SIZE as u32);
 }
 
 #[inline]

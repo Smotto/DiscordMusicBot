@@ -63,6 +63,8 @@ pub(crate) struct AuxNetwork {
     dave_media_allowed: Arc<AtomicBool>,
     dave_pending_transitions: HashMap<u16, u16>,
     recognized_user_ids: HashSet<UserId>,
+    /// Follow-up speaking packet after DAVE transitions (member join/leave re-key).
+    pending_speaking_reassert: Option<Instant>,
 
     #[cfg(feature = "receive")]
     ssrc_signalling: Arc<SsrcTracker>,
@@ -107,10 +109,27 @@ impl AuxNetwork {
             dave_media_allowed,
             dave_pending_transitions: HashMap::new(),
             recognized_user_ids,
+            pending_speaking_reassert: None,
 
             #[cfg(feature = "receive")]
             ssrc_signalling,
         }
+    }
+
+    async fn send_speaking_gateway(&mut self) -> Result<(), WsError> {
+        if self.dave_protocol_version.load(Ordering::Relaxed) != 0
+            && !self.dave_media_allowed.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.ws_client
+            .send_json(&GatewayEvent::from(Speaking {
+                delay: Some(0),
+                speaking: self.speaking,
+                ssrc: self.ssrc,
+                user_id: None,
+            }))
+            .await
     }
 
     #[instrument(skip(self))]
@@ -123,6 +142,13 @@ impl AuxNetwork {
             let mut ws_reason = None;
 
             let hb = sleep_until(next_heartbeat);
+            let reassert_sleep = async {
+                if let Some(deadline) = self.pending_speaking_reassert {
+                    sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
 
             select! {
                 biased;
@@ -137,6 +163,20 @@ impl AuxNetwork {
                         _ => false,
                     };
                     next_heartbeat = self.next_heartbeat();
+                }
+                () = reassert_sleep, if self.pending_speaking_reassert.is_some() => {
+                    self.pending_speaking_reassert = None;
+                    if self.speaking.contains(SpeakingState::MICROPHONE) && !self.dont_send {
+                        match self.send_speaking_gateway().await {
+                            Ok(()) => info!("DAVE: Delayed speaking re-assert sent"),
+                            Err(e) => {
+                                warn!("WS: Delayed speaking re-assert failed: {e:?}");
+                                ws_error = true;
+                                should_reconnect = ws_error_is_not_final(&e);
+                                ws_reason = Some((&e).into());
+                            }
+                        }
+                    }
                 }
                 inner_msg = self.rx.recv_async() => {
                     match inner_msg {
@@ -155,31 +195,40 @@ impl AuxNetwork {
                             next_heartbeat = self.next_heartbeat();
                         },
                         Ok(WsMessage::Speaking(is_speaking)) => {
-                            if self.speaking.contains(SpeakingState::MICROPHONE) != is_speaking && !self.dont_send {
+                            if self.dont_send {
+                                continue;
+                            }
+                            let had_mic = self.speaking.contains(SpeakingState::MICROPHONE);
+                            if is_speaking != had_mic {
                                 self.speaking.set(SpeakingState::MICROPHONE, is_speaking);
-                                if is_speaking
-                                    && self.dave_protocol_version.load(Ordering::Relaxed) != 0
-                                    && !self.dave_media_allowed.load(Ordering::Acquire)
-                                {
-                                    continue;
+                            }
+                            if is_speaking {
+                                // Re-send even when already speaking — DAVE re-key after VC
+                                // membership changes requires a fresh gateway speaking packet.
+                                if had_mic {
+                                    info!("Re-asserting speaking (already MICROPHONE)");
+                                } else {
+                                    info!("Changing to {:?}", self.speaking);
                                 }
-                                info!("Changing to {:?}", self.speaking);
-
-                                let ssu_status = self.ws_client
-                                    .send_json(&GatewayEvent::from(Speaking {
-                                        delay: Some(0),
-                                        speaking: self.speaking,
-                                        ssrc: self.ssrc,
-                                        user_id: None,
-                                    }))
-                                    .await;
-
+                                let ssu_status = self.send_speaking_gateway().await;
                                 ws_error |= match ssu_status {
                                     Err(e) => {
                                         should_reconnect = ws_error_is_not_final(&e);
                                         ws_reason = Some((&e).into());
                                         true
-                                    },
+                                    }
+                                    _ => false,
+                                }
+                            } else if had_mic {
+                                self.speaking.set(SpeakingState::MICROPHONE, false);
+                                info!("Changing to {:?}", self.speaking);
+                                let ssu_status = self.send_speaking_gateway().await;
+                                ws_error |= match ssu_status {
+                                    Err(e) => {
+                                        should_reconnect = ws_error_is_not_final(&e);
+                                        ws_reason = Some((&e).into());
+                                        true
+                                    }
                                     _ => false,
                                 }
                             }
@@ -465,23 +514,10 @@ impl AuxNetwork {
                         }))
                         .await?;
                     info!("DAVE: DaveMlsCommitWelcome sent successfully");
-
-                    // As committer, merge our pending MLS commit locally. Discord may not
-                    // send AnnounceCommitTransition promptly (or at all for transition_id 0).
-                    if let Some(ref mut dave_session) = *self.dave_session.write().unwrap() {
-                        match dave_session.process_commit(&commit_welcome.commit) {
-                            Ok(()) => info!(
-                                "DAVE: Local commit merged after CommitWelcome, is_ready={}",
-                                dave_session.is_ready()
-                            ),
-                            Err(e) => warn!(
-                                error = ?e,
-                                "DAVE: local process_commit after CommitWelcome failed"
-                            ),
-                        }
-                    }
-                    // Wait for DaveExecuteTransition before sending RTP on the new epoch.
-                    self.dave_media_allowed.store(false, Ordering::Release);
+                    // Do NOT process_commit here. DAVE requires senders to keep using the
+                    // previous epoch's keys until DaveExecuteTransition (daveprotocol.com,
+                    // Member Removal / Commit Handling). Commit is merged on
+                    // DaveMlsAnnounceCommitTransition instead (see dysnomia/davey USAGE).
                 } else {
                     info!("DAVE: process_proposals returned None (no commit/welcome to send)");
                 }
@@ -493,80 +529,54 @@ impl AuxNetwork {
                 info!("DAVE: After proposals, is_ready={}", is_ready);
             },
             GatewayEvent::DaveMlsAnnounceCommitTransition(ev) => {
-                let already_ready = self
-                    .dave_session
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|s| s.is_ready());
+                info!(
+                    "DAVE: Received DaveMlsAnnounceCommitTransition (transition_id={})",
+                    ev.transition_id
+                );
+                match self.dave_process_commit(&ev.commit_message) {
+                    Some(Ok(())) if ev.transition_id != 0 => {
+                        let protocol_version = self.dave_protocol_version.load(Ordering::Relaxed);
 
-                if already_ready {
-                    if ev.transition_id != 0 {
-                        info!(
-                            "DAVE: AnnounceCommitTransition (transition_id={}) after local merge — registering for execute",
-                            ev.transition_id
-                        );
-                        let protocol_version =
-                            self.dave_protocol_version.load(Ordering::Relaxed);
                         self.dave_pending_transitions
                             .insert(ev.transition_id, protocol_version);
+                        // Keys rotate in davey here; stop RTP until ExecuteTransition so we
+                        // don't send new-epoch frames while listeners still expect old epoch.
+                        self.dave_media_allowed.store(false, Ordering::Release);
+                        info!(
+                            "DAVE: Commit merged (transition_id={}) — RTP gated until execute",
+                            ev.transition_id
+                        );
                         self.ws_client
                             .send_json(&GatewayEvent::from(DaveTransitionReady {
                                 transition_id: ev.transition_id,
                                 protocol_version,
                             }))
                             .await?;
-                    } else {
-                        tracing::debug!(
-                            "DAVE: AnnounceCommitTransition (transition_id=0) after local merge — already ready"
-                        );
-                    }
-                } else {
-                    info!(
-                        "DAVE: Received DaveMlsAnnounceCommitTransition (transition_id={})",
-                        ev.transition_id
-                    );
-                    match self.dave_process_commit(&ev.commit_message) {
-                        Some(Ok(())) if ev.transition_id != 0 => {
-                            let protocol_version =
-                                self.dave_protocol_version.load(Ordering::Relaxed);
-
-                            self.dave_pending_transitions
-                                .insert(ev.transition_id, protocol_version);
-                            self.ws_client
-                                .send_json(&GatewayEvent::from(DaveTransitionReady {
-                                    transition_id: ev.transition_id,
-                                    protocol_version,
-                                }))
-                                .await?;
-                        },
-                        Some(Ok(())) => {
-                            info!("DAVE: Commit processed for transition_id=0");
-                            self.try_enable_dave_media(interconnect).await;
-                        },
-                        Some(Err(e)) if is_stale_dave_commit_error(&e) => {
-                            tracing::debug!(
-                                "DAVE: Stale commit announcement ignored: {e:?}"
-                            );
-                            self.try_enable_dave_media(interconnect).await;
-                        },
-                        Some(Err(e)) => {
-                            warn!("MLS commit errored: {e:?}");
-                            self.ws_client
-                                .send_json(&GatewayEvent::from(DaveMlsInvalidCommitWelcome {
-                                    transition_id: ev.transition_id,
-                                }))
-                                .await?;
-                            match self.reinit_dave_session().await {
-                                Err(DaveReinitError::Ws(e)) => return Err(e),
-                                Err(e) => {
-                                    warn!(error = ?e, "failed to reinitialize DAVE session");
-                                },
-                                _ => {},
-                            }
-                        },
-                        None => {},
-                    }
+                    },
+                    Some(Ok(())) => {
+                        info!("DAVE: Commit processed for transition_id=0");
+                        self.try_enable_dave_media(interconnect).await;
+                    },
+                    Some(Err(e)) if is_stale_dave_commit_error(&e) => {
+                        tracing::debug!("DAVE: Stale commit announcement ignored: {e:?}");
+                        self.try_enable_dave_media(interconnect).await;
+                    },
+                    Some(Err(e)) => {
+                        warn!("MLS commit errored: {e:?}");
+                        self.ws_client
+                            .send_json(&GatewayEvent::from(DaveMlsInvalidCommitWelcome {
+                                transition_id: ev.transition_id,
+                            }))
+                            .await?;
+                        match self.reinit_dave_session().await {
+                            Err(DaveReinitError::Ws(e)) => return Err(e),
+                            Err(e) => {
+                                warn!(error = ?e, "failed to reinitialize DAVE session");
+                            },
+                            _ => {},
+                        }
+                    },
+                    None => {},
                 }
             },
             GatewayEvent::DaveMlsWelcome(ev) => {
@@ -720,19 +730,20 @@ impl AuxNetwork {
     }
 
     async fn reassert_speaking_after_dave(&mut self) {
-        if self.speaking.contains(SpeakingState::MICROPHONE) && !self.dont_send {
-            if let Err(e) = self
-                .ws_client
-                .send_json(&GatewayEvent::from(Speaking {
-                    delay: Some(0),
-                    speaking: self.speaking,
-                    ssrc: self.ssrc,
-                    user_id: None,
-                }))
-                .await
-            {
-                warn!("WS: Failed to re-assert speaking after DAVE transition: {:?}", e);
-            }
+        if !self.speaking.contains(SpeakingState::MICROPHONE) || self.dont_send {
+            return;
+        }
+
+        match self.send_speaking_gateway().await {
+            Ok(()) => info!("DAVE: Speaking re-asserted after transition"),
+            Err(e) => warn!("WS: Failed to re-assert speaking after DAVE transition: {e:?}"),
+        }
+    }
+
+    fn schedule_delayed_speaking_reassert(&mut self) {
+        if self.speaking.contains(SpeakingState::MICROPHONE) {
+            self.pending_speaking_reassert =
+                Some(Instant::now() + Duration::from_millis(250));
         }
     }
 
@@ -753,6 +764,7 @@ impl AuxNetwork {
                     );
                 }
                 self.reassert_speaking_after_dave().await;
+                self.schedule_delayed_speaking_reassert();
                 self.notify_mixer_reassert_speaking(interconnect, transition_id)
                     .await;
             }
@@ -777,6 +789,7 @@ impl AuxNetwork {
         // Re-assert speaking now that DAVE allows media — the earlier speaking
         // packet was deferred because dave_media_allowed was false.
         self.reassert_speaking_after_dave().await;
+        self.schedule_delayed_speaking_reassert();
         self.notify_mixer_reassert_speaking(interconnect, transition_id)
             .await;
     }
