@@ -31,7 +31,6 @@ pub struct Handler {
     pub spotify_status_board: Arc<crate::spotify_status::SpotifyStatusBoard>,
     /// In-flight `/spotify play` tasks — aborted by `/stop`.
     pub spotify_play_tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>>,
-    pub spotify_capture_recovery_registered: Arc<Mutex<HashSet<u64>>>,
 }
 
 fn ack(msg: impl Into<String>) -> CreateInteractionResponse {
@@ -69,7 +68,6 @@ pub async fn run_bot() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         spotify_queue_watcher: Arc::new(Mutex::new(None)),
         spotify_status_board: crate::spotify_status::SpotifyStatusBoard::new(),
         spotify_play_tasks: Arc::new(Mutex::new(HashMap::new())),
-        spotify_capture_recovery_registered: Arc::new(Mutex::new(HashSet::new())),
     };
 
     let mut client = Client::builder(token, intents)
@@ -213,28 +211,43 @@ impl EventHandler for Handler {
             return;
         };
 
-        let left_channel = before.as_ref().and_then(|b| b.channel_id);
-        if left_channel.is_none() || after.channel_id.is_some() {
-            return;
-        }
-
-        let Some(handler_lock) = self.songbird.get(guild_id) else {
-            return;
+        let bot_channel_id = if let Some(handler_lock) = self.songbird.get(guild_id) {
+            handler_lock
+                .lock()
+                .await
+                .current_channel()
+                .map(|ch| ch.0.get())
+        } else {
+            None
         };
-        let bot_channel = handler_lock.lock().await.current_channel().map(|c| c.0.get());
-        if bot_channel != left_channel.map(|c| c.get()) {
-            return;
-        }
 
-        stream::schedule_capture_recovery(
-            "user-left-vc",
-            self.songbird.clone(),
-            guild_id,
-            self.voice_idle.clone(),
-            self.stream_sessions.clone(),
-            self.playback_modes.clone(),
-        )
-        .await;
+        let stream_active = self.spotify_stream_active().await;
+        let mode = self.playback_modes.get(guild_id).await;
+
+        crate::audio_diag::log_gateway_voice_state(
+            "VoiceStateUpdate",
+            before.as_ref(),
+            &after,
+            bot_channel_id,
+            stream_active,
+            mode,
+        );
+
+        if stream_active {
+            let songbird = self.songbird.clone();
+            let stream_sessions = self.stream_sessions.clone();
+            let playback_modes = self.playback_modes.clone();
+            tokio::spawn(async move {
+                crate::audio_diag::snapshot(
+                    "after_gateway_voice_state",
+                    guild_id,
+                    &songbird,
+                    &stream_sessions,
+                    &playback_modes,
+                )
+                .await;
+            });
+        }
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -440,6 +453,7 @@ impl Handler {
         let current_mode = self.playback_modes.get(guild_id).await;
         if current_mode == GuildPlayback::Spotify {
             crate::stream::stop_guild_stream(
+                "command:youtube_play",
                 &self.songbird,
                 guild_id,
                 &self.stream_sessions,
@@ -919,7 +933,6 @@ impl Handler {
         let ctx = ctx.clone();
         let cmd = cmd.clone();
         let spotify_play_tasks = self.spotify_play_tasks.clone();
-        let spotify_capture_recovery_registered = self.spotify_capture_recovery_registered.clone();
         let requester = Some(Self::spotify_requester(&cmd));
 
         self.cancel_spotify_play(guild_id).await;
@@ -1003,14 +1016,7 @@ impl Handler {
 
             match tokio::time::timeout(
                 Duration::from_secs(90),
-                stream::start_guild_stream(
-                    &songbird,
-                    guild_id,
-                    idle,
-                    &spotify_capture_recovery_registered,
-                    stream_sessions.clone(),
-                    playback_modes.clone(),
-                ),
+                stream::start_guild_stream(&songbird, guild_id, idle),
             )
             .await
             {

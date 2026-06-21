@@ -71,7 +71,14 @@ impl VoiceIdleManager {
         let stream_sessions = self.stream_sessions.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(VOICE_IDLE_TIMEOUT).await;
-            if !is_voice_idle(&songbird, guild_id, &playback_modes, &stream_sessions).await {
+            if !is_voice_idle(
+                &songbird,
+                guild_id,
+                &playback_modes,
+                &stream_sessions,
+                "idle_timer",
+            )
+            .await {
                 return;
             }
             tracing::info!(
@@ -94,19 +101,65 @@ async fn is_voice_idle(
     guild_id: GuildId,
     playback_modes: &PlaybackModes,
     stream_sessions: &Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
+    diag_context: &str,
 ) -> bool {
-    if playback_modes.get(guild_id).await == GuildPlayback::Spotify {
+    let mode = playback_modes.get(guild_id).await;
+    if mode == GuildPlayback::Spotify {
+        crate::audio_diag::log_idle_check(
+            guild_id,
+            diag_context,
+            false,
+            mode,
+            stream_sessions.lock().await.contains_key(&guild_id.get()),
+            false,
+            true,
+        )
+        .await;
         return false;
     }
-    if stream_sessions.lock().await.contains_key(&guild_id.get()) {
+    let stream_active = stream_sessions.lock().await.contains_key(&guild_id.get());
+    if stream_active {
+        crate::audio_diag::log_idle_check(
+            guild_id,
+            diag_context,
+            false,
+            mode,
+            true,
+            false,
+            true,
+        )
+        .await;
         return false;
     }
 
     let Some(handler_lock) = songbird.get(guild_id) else {
+        crate::audio_diag::log_idle_check(
+            guild_id,
+            diag_context,
+            false,
+            mode,
+            false,
+            true,
+            false,
+        )
+        .await;
         return false;
     };
     let handler = handler_lock.lock().await;
-    handler.current_channel().is_some() && handler.queue().is_empty()
+    let in_channel = handler.current_channel().is_some();
+    let queue_empty = handler.queue().current_queue().is_empty();
+    let would_idle = in_channel && queue_empty;
+    crate::audio_diag::log_idle_check(
+        guild_id,
+        diag_context,
+        would_idle,
+        mode,
+        false,
+        queue_empty,
+        in_channel,
+    )
+    .await;
+    would_idle
 }
 
 async fn idle_disconnect(
@@ -116,8 +169,16 @@ async fn idle_disconnect(
     stream_sessions: &Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
 ) {
     if stream_sessions.lock().await.contains_key(&guild_id.get()) {
+        crate::audio_diag::warn(format!(
+            "idle_disconnect guild={guild_id}: skipped — spotify stream session still active"
+        ));
         return;
     }
+    crate::audio_diag::log_stop(
+        "idle_timeout",
+        guild_id,
+        "idle_disconnect — leaving voice after empty queue timeout",
+    );
     let Some(handler_lock) = songbird.get(guild_id) else {
         return;
     };
@@ -131,6 +192,120 @@ async fn idle_disconnect(
         Err(e) => tracing::warn!("Idle leave failed for guild {guild_id}: {e}"),
     }
     registered.lock().await.remove(&guild_id.get());
+}
+
+#[derive(Clone)]
+struct DiagTrackEvents {
+    guild_id: GuildId,
+    songbird: Arc<Songbird>,
+    stream_sessions: Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
+    playback_modes: Arc<PlaybackModes>,
+}
+
+#[async_trait::async_trait]
+impl SongbirdEventHandler for DiagTrackEvents {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<SongbirdEvent> {
+        if let EventContext::Track(states) = ctx {
+            for (state, handle) in *states {
+                let detail = match &state.playing {
+                    PlayMode::Play => format!("play uuid={:?}", handle.uuid()),
+                    PlayMode::Errored(e) => format!("error uuid={:?} err={e:?}", handle.uuid()),
+                    other if other.is_done() => format!("done uuid={:?} mode={other:?}", handle.uuid()),
+                    other => format!("state uuid={:?} mode={other:?}", handle.uuid()),
+                };
+                crate::audio_diag::log_track_event(self.guild_id, "event", &detail);
+
+                if state.playing.is_done() || matches!(state.playing, PlayMode::Errored(_)) {
+                    crate::audio_diag::snapshot(
+                        "track_end_or_error",
+                        self.guild_id,
+                        &self.songbird,
+                        &self.stream_sessions,
+                        &self.playback_modes,
+                    )
+                    .await;
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone)]
+struct DiagVoiceEvents {
+    guild_id: GuildId,
+    songbird: Arc<Songbird>,
+    stream_sessions: Arc<Mutex<HashMap<u64, crate::stream::StreamSession>>>,
+    playback_modes: Arc<PlaybackModes>,
+}
+
+#[async_trait::async_trait]
+impl SongbirdEventHandler for DiagVoiceEvents {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<SongbirdEvent> {
+        match ctx {
+            EventContext::DriverDisconnect(data) => {
+                crate::audio_diag::log_voice_core(
+                    self.guild_id,
+                    "DriverDisconnect",
+                    &format!("kind={:?} reason={:?}", data.kind, data.reason),
+                );
+                crate::audio_diag::snapshot(
+                    "driver_disconnect",
+                    self.guild_id,
+                    &self.songbird,
+                    &self.stream_sessions,
+                    &self.playback_modes,
+                )
+                .await;
+            }
+            EventContext::DriverReconnect(data) => {
+                crate::audio_diag::log_voice_core(
+                    self.guild_id,
+                    "DriverReconnect",
+                    &format!("server={}", data.server),
+                );
+                crate::audio_diag::snapshot(
+                    "driver_reconnect",
+                    self.guild_id,
+                    &self.songbird,
+                    &self.stream_sessions,
+                    &self.playback_modes,
+                )
+                .await;
+            }
+            EventContext::DriverConnect(data) => {
+                crate::audio_diag::log_voice_core(
+                    self.guild_id,
+                    "DriverConnect",
+                    &format!("server={}", data.server),
+                );
+            }
+            EventContext::ClientDisconnect(data) => {
+                crate::audio_diag::log_voice_core(
+                    self.guild_id,
+                    "ClientDisconnect",
+                    &format!("user={:?}", data.user_id),
+                );
+                crate::audio_diag::snapshot(
+                    "client_disconnect",
+                    self.guild_id,
+                    &self.songbird,
+                    &self.stream_sessions,
+                    &self.playback_modes,
+                )
+                .await;
+            }
+            EventContext::ClientConnect(data) => {
+                crate::audio_diag::log_voice_core(
+                    self.guild_id,
+                    "ClientConnect",
+                    &format!("user={:?} ssrc={}", data.user_id, data.audio_ssrc),
+                );
+            }
+            _ => {}
+        }
+        None
+    }
 }
 
 struct IdleDisconnectOnEnd {
@@ -154,66 +329,30 @@ impl SongbirdEventHandler for IdleDisconnectOnEnd {
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
+            crate::audio_diag::snapshot(
+                "idle_disconnect_on_end",
+                guild_id,
+                &songbird,
+                &stream_sessions,
+                &playback_modes,
+            )
+            .await;
             if is_voice_idle(
                 &songbird,
                 guild_id,
                 &playback_modes,
                 &stream_sessions,
+                "track_end_idle_check",
             )
             .await
             {
+                crate::audio_diag::warn(format!(
+                    "IdleDisconnectOnEnd guild={guild_id}: scheduling idle leave timer"
+                ));
                 idle.schedule(songbird, guild_id, registered).await;
             }
         });
 
-        None
-    }
-}
-
-struct LogTrackEvents;
-
-#[async_trait::async_trait]
-impl SongbirdEventHandler for LogTrackEvents {
-    async fn act(&self, ctx: &EventContext<'_>) -> Option<SongbirdEvent> {
-        if let EventContext::Track(states) = ctx {
-            for (state, _) in *states {
-                match &state.playing {
-                    PlayMode::Play => tracing::info!("Track started playing"),
-                    PlayMode::Errored(e) => tracing::error!("Track playback error: {e:?}"),
-                    other if other.is_done() => tracing::info!("Track finished: {other:?}"),
-                    other => tracing::debug!("Track state: {other:?}"),
-                }
-            }
-        }
-        None
-    }
-}
-
-struct LogVoiceEvents;
-
-#[async_trait::async_trait]
-impl SongbirdEventHandler for LogVoiceEvents {
-    async fn act(&self, ctx: &EventContext<'_>) -> Option<SongbirdEvent> {
-        match ctx {
-            EventContext::DriverDisconnect(data) => {
-                tracing::warn!(
-                    "Voice driver disconnected: guild={} kind={:?} reason={:?}",
-                    data.guild_id,
-                    data.kind,
-                    data.reason
-                );
-            }
-            EventContext::DriverReconnect(data) => {
-                tracing::info!(
-                    "Voice driver reconnected to {} (audio should continue)",
-                    data.server
-                );
-            }
-            EventContext::DriverConnect(data) => {
-                tracing::info!("Voice driver connected to {}", data.server);
-            }
-            _ => {}
-        }
         None
     }
 }
@@ -462,35 +601,55 @@ async fn register_track_events(
     drop(set);
 
     let stream_sessions = idle.stream_sessions();
+    let playback_modes = idle.playback_modes();
 
-    handler.add_global_event(
-        Event::Track(TrackEvent::Error),
-        LogTrackEvents,
-    );
-    handler.add_global_event(
-        Event::Track(TrackEvent::Playable),
-        LogTrackEvents,
-    );
-    handler.add_global_event(Event::Track(TrackEvent::Play), LogTrackEvents);
-    handler.add_global_event(Event::Track(TrackEvent::End), LogTrackEvents);
+    let diag_track = DiagTrackEvents {
+        guild_id,
+        songbird: songbird.clone(),
+        stream_sessions: stream_sessions.clone(),
+        playback_modes: playback_modes.clone(),
+    };
+    let diag_voice = DiagVoiceEvents {
+        guild_id,
+        songbird: songbird.clone(),
+        stream_sessions,
+        playback_modes,
+    };
+
+    handler.add_global_event(Event::Track(TrackEvent::Error), diag_track.clone());
+    handler.add_global_event(Event::Track(TrackEvent::Playable), diag_track.clone());
+    handler.add_global_event(Event::Track(TrackEvent::Play), diag_track.clone());
+    handler.add_global_event(Event::Track(TrackEvent::End), diag_track);
     handler.add_global_event(
         Event::Track(TrackEvent::End),
         IdleDisconnectOnEnd {
-            songbird,
+            songbird: diag_voice.songbird.clone(),
             guild_id,
             idle: idle.clone(),
             registered: registered.clone(),
             playback_modes: idle.playback_modes(),
-            stream_sessions,
+            stream_sessions: idle.stream_sessions(),
         },
     );
     handler.add_global_event(
         Event::Core(CoreEvent::DriverDisconnect),
-        LogVoiceEvents,
+        diag_voice.clone(),
     );
     handler.add_global_event(
         Event::Core(CoreEvent::DriverReconnect),
-        LogVoiceEvents,
+        diag_voice.clone(),
+    );
+    handler.add_global_event(
+        Event::Core(CoreEvent::DriverConnect),
+        diag_voice.clone(),
+    );
+    handler.add_global_event(
+        Event::Core(CoreEvent::ClientConnect),
+        diag_voice.clone(),
+    );
+    handler.add_global_event(
+        Event::Core(CoreEvent::ClientDisconnect),
+        diag_voice,
     );
 }
 
@@ -501,6 +660,23 @@ pub async fn join_voice(
     registered: Arc<Mutex<HashSet<u64>>>,
     idle: Arc<VoiceIdleManager>,
 ) -> Result<(), String> {
+    if let Some(handle) = songbird.get(guild_id) {
+        let mut call = handle.lock().await;
+        if call.current_channel() == Some(channel_id.into()) {
+            register_track_events(
+                &mut call,
+                &registered,
+                guild_id,
+                songbird.clone(),
+                idle.clone(),
+            )
+            .await;
+            call.reconnect_voice_driver_if_inactive();
+            tracing::info!("Already in voice channel {channel_id} in guild {guild_id}");
+            return Ok(());
+        }
+    }
+
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
 
@@ -635,7 +811,7 @@ pub async fn play(
 
     // Clear an active Spotify capture session before YouTube enqueue.
     if stream_sessions.lock().await.contains_key(&guild_id.get()) {
-        crate::stream::stop_guild_stream(&songbird, guild_id, stream_sessions)
+        crate::stream::stop_guild_stream("command:youtube_play", &songbird, guild_id, stream_sessions)
             .await
             .ok();
     }
@@ -766,7 +942,8 @@ pub async fn stop_all(
     stream_sessions: &Arc<Mutex<std::collections::HashMap<u64, crate::stream::StreamSession>>>,
     playback_modes: &Arc<crate::playback::PlaybackModes>,
 ) -> Result<(), String> {
-    crate::stream::stop_guild_stream(songbird, guild_id, stream_sessions)
+    crate::audio_diag::log_stop("command:stop_all", guild_id, "stop_all beginning");
+    crate::stream::stop_guild_stream("command:stop_all", songbird, guild_id, stream_sessions)
         .await
         .ok();
 
@@ -777,6 +954,11 @@ pub async fn stop_all(
 
     if let Some(handler_lock) = songbird.get(guild_id) {
         let mut handler = handler_lock.lock().await;
+        crate::audio_diag::log_stop(
+            "command:stop_all",
+            guild_id,
+            "calling handler.queue().stop() and handler.stop()",
+        );
         handler.queue().stop();
         handler.stop();
     }

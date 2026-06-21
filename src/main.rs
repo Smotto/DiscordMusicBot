@@ -1,3 +1,4 @@
+mod audio_diag;
 mod audio_pipe;
 mod bot;
 mod music;
@@ -13,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,songbird=debug,serenity::gateway=warn".into()),
+                .unwrap_or_else(|_| "info,audio_diag=info,songbird=debug,serenity::gateway=warn".into()),
         )
         .init();
     bot::run_bot().await

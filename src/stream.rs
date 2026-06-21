@@ -1,24 +1,17 @@
 use crate::audio_pipe::{buffer_initial_bytes_with_timeout_min, PrefixedPipe};
-use crate::playback::{GuildPlayback, PlaybackModes};
 use serenity::all::GuildId;
-use songbird::events::{CoreEvent, Event, EventContext, EventHandler as SongbirdEventHandler, TrackEvent};
 use songbird::input::core::io::ReadOnlySource;
 use songbird::input::RawAdapter;
 use songbird::input::codecs::{get_codec_registry, get_probe};
 use songbird::input::{ChildContainer, Input};
 use songbird::tracks::Track;
-use songbird::{Call, Event as SongbirdEvent, Songbird};
-use std::collections::{HashMap, HashSet};
+use songbird::Songbird;
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::process::{Child, Stdio};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-
-/// Debounce overlapping recovery attempts (DAVE transitions, track end, user leave).
-static CAPTURE_RECOVERY_INFLIGHT: LazyLock<Mutex<HashSet<u64>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-const CAPTURE_RECOVERY_DELAY: Duration = Duration::from_millis(800);
 
 /// Default capture bus — must match the B* button lit on the Voicemeeter Input strip.
 pub const DEFAULT_DEVICE: &str = "Voicemeeter Out B2 (VB-Audio Voicemeeter VAIO)";
@@ -50,7 +43,7 @@ pub fn capture_volume() -> f32 {
         .unwrap_or(0.99)
 }
 
-/// Marker that a Spotify stream is active.
+/// Marker that a Spotify Voicemeeter capture session is active for a guild.
 pub struct StreamSession;
 
 /// Probe whether ffmpeg can hear audio on the configured device (run while Spotify plays).
@@ -165,11 +158,7 @@ fn spawn_voicemeeter_playable(device: &str, volume: f32) -> Result<Input, String
     })
 }
 
-async fn enqueue_guild_capture(
-    songbird: &Arc<Songbird>,
-    guild_id: GuildId,
-    replace_existing: bool,
-) -> Result<(), String> {
+async fn enqueue_guild_capture(songbird: &Arc<Songbird>, guild_id: GuildId) -> Result<(), String> {
     let device = capture_device();
     let volume = capture_volume();
 
@@ -177,10 +166,7 @@ async fn enqueue_guild_capture(
         return Err("Bot is not in a voice channel.".into());
     }
 
-    tracing::info!(
-        "Spotify stream: opening capture on \"{device}\"{}",
-        if replace_existing { " (recovery)" } else { "" }
-    );
+    tracing::info!("Spotify stream: opening capture on \"{device}\"");
     let input = tokio::task::spawn_blocking(move || spawn_voicemeeter_playable(&device, volume))
         .await
         .map_err(|e| format!("Capture task failed: {e}"))??;
@@ -190,11 +176,6 @@ async fn enqueue_guild_capture(
     let handler_lock = songbird
         .get(guild_id)
         .ok_or("Voice handler missing.")?;
-
-    if replace_existing {
-        let handler = handler_lock.lock().await;
-        handler.queue().stop();
-    }
 
     let mut handler = handler_lock.lock().await;
     if !handler.is_voice_driver_active() {
@@ -226,165 +207,41 @@ async fn enqueue_guild_capture(
 /// Capture VoiceMeeter output and stream it to Discord.
 ///
 /// Caller must already have joined voice (`ensure_in_voice`) so DAVE can finish before capture.
+/// Voice events (joins, screen share, DAVE) do not stop or restart this — only slash commands do.
 pub async fn start_guild_stream(
     songbird: &Arc<Songbird>,
     guild_id: GuildId,
     idle: Arc<crate::music::VoiceIdleManager>,
-    recovery_registered: &Arc<AsyncMutex<HashSet<u64>>>,
-    stream_sessions: Arc<AsyncMutex<HashMap<u64, StreamSession>>>,
-    playback_modes: Arc<PlaybackModes>,
 ) -> Result<StreamSession, String> {
-    enqueue_guild_capture(songbird, guild_id, false).await?;
+    enqueue_guild_capture(songbird, guild_id).await?;
     idle.cancel(guild_id).await;
-
-    if let Some(handler_lock) = songbird.get(guild_id) {
-        let mut handler = handler_lock.lock().await;
-        register_capture_recovery_events(
-            &mut handler,
-            guild_id,
-            songbird.clone(),
-            idle,
-            stream_sessions,
-            playback_modes,
-            recovery_registered,
-        )
-        .await;
-    }
-
+    crate::audio_diag::event(format!("STREAM_STARTED guild={guild_id}"));
     Ok(StreamSession)
 }
 
-/// Re-open Voicemeeter capture after DAVE or voice events stop the active track.
-pub async fn restart_guild_capture(
-    songbird: &Arc<Songbird>,
-    guild_id: GuildId,
-    idle: Arc<crate::music::VoiceIdleManager>,
-) -> Result<(), String> {
-    enqueue_guild_capture(songbird, guild_id, true).await?;
-    idle.cancel(guild_id).await;
-    Ok(())
-}
-
-/// Schedule a debounced capture restart while a Spotify stream session is active.
-pub async fn schedule_capture_recovery(
-    reason: &'static str,
-    songbird: Arc<Songbird>,
-    guild_id: GuildId,
-    idle: Arc<crate::music::VoiceIdleManager>,
-    stream_sessions: Arc<AsyncMutex<HashMap<u64, StreamSession>>>,
-    playback_modes: Arc<PlaybackModes>,
-) {
-    if !stream_sessions.lock().await.contains_key(&guild_id.get()) {
-        return;
-    }
-    if playback_modes.get(guild_id).await != GuildPlayback::Spotify {
-        return;
-    }
-
-    let acquired = {
-        let mut inflight = CAPTURE_RECOVERY_INFLIGHT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        inflight.insert(guild_id.get())
-    };
-    if !acquired {
-        return;
-    }
-
-    tokio::spawn(async move {
-        tokio::time::sleep(CAPTURE_RECOVERY_DELAY).await;
-
-        let still_active = stream_sessions.lock().await.contains_key(&guild_id.get())
-            && playback_modes.get(guild_id).await == GuildPlayback::Spotify;
-
-        if still_active {
-            match restart_guild_capture(&songbird, guild_id, idle).await {
-                Ok(()) => tracing::info!(
-                    "Spotify capture recovered for guild {guild_id} ({reason})"
-                ),
-                Err(e) => tracing::warn!(
-                    "Spotify capture recovery failed for guild {guild_id} ({reason}): {e}"
-                ),
-            }
-        }
-
-        CAPTURE_RECOVERY_INFLIGHT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&guild_id.get());
-    });
-}
-
-#[derive(Clone)]
-struct CaptureRecovery {
-    reason: &'static str,
-    guild_id: GuildId,
-    songbird: Arc<Songbird>,
-    idle: Arc<crate::music::VoiceIdleManager>,
-    stream_sessions: Arc<AsyncMutex<HashMap<u64, StreamSession>>>,
-    playback_modes: Arc<PlaybackModes>,
-}
-
-#[async_trait::async_trait]
-impl SongbirdEventHandler for CaptureRecovery {
-    async fn act(&self, _ctx: &EventContext<'_>) -> Option<SongbirdEvent> {
-        schedule_capture_recovery(
-            self.reason,
-            self.songbird.clone(),
-            self.guild_id,
-            self.idle.clone(),
-            self.stream_sessions.clone(),
-            self.playback_modes.clone(),
-        )
-        .await;
-        None
-    }
-}
-
-/// Watch for capture track loss and restart Voicemeeter → Discord streaming.
-pub async fn register_capture_recovery_events(
-    handler: &mut Call,
-    guild_id: GuildId,
-    songbird: Arc<Songbird>,
-    idle: Arc<crate::music::VoiceIdleManager>,
-    stream_sessions: Arc<AsyncMutex<HashMap<u64, StreamSession>>>,
-    playback_modes: Arc<PlaybackModes>,
-    recovery_registered: &Arc<AsyncMutex<HashSet<u64>>>,
-) {
-    if !recovery_registered.lock().await.insert(guild_id.get()) {
-        return;
-    }
-
-    let recovery = CaptureRecovery {
-        reason: "track-event",
-        guild_id,
-        songbird,
-        idle,
-        stream_sessions,
-        playback_modes,
-    };
-
-    handler.add_global_event(Event::Track(TrackEvent::End), recovery.clone());
-    handler.add_global_event(Event::Track(TrackEvent::Error), recovery.clone());
-    handler.add_global_event(
-        Event::Core(CoreEvent::DriverDisconnect),
-        CaptureRecovery {
-            reason: "driver-disconnect",
-            ..recovery
-        },
-    );
-}
-
+/// Stop Voicemeeter capture — only call from explicit `/stop` or mode switches.
 pub async fn stop_guild_stream(
+    caller: &'static str,
     songbird: &Arc<Songbird>,
     guild_id: GuildId,
     sessions: &Arc<AsyncMutex<HashMap<u64, StreamSession>>>,
 ) -> Result<(), String> {
-    sessions.lock().await.remove(&guild_id.get());
+    let had_session = sessions.lock().await.remove(&guild_id.get()).is_some();
+    crate::audio_diag::log_stop(
+        caller,
+        guild_id,
+        &format!("stop_guild_stream (had_session={had_session})"),
+    );
 
     if let Some(handler_lock) = songbird.get(guild_id) {
-        let mut handler = handler_lock.lock().await;
+        let handler = handler_lock.lock().await;
+        let queue_len = handler.queue().current_queue().len();
         handler.queue().stop();
-        handler.stop();
-        tracing::info!("Stopped Spotify stream for guild {guild_id}");
+        tracing::info!("Stopped Spotify capture track for guild {guild_id} (queue had {queue_len} tracks)");
+    } else {
+        crate::audio_diag::warn(format!(
+            "stop_guild_stream [{caller}] guild={guild_id}: no songbird handler"
+        ));
     }
 
     Ok(())
